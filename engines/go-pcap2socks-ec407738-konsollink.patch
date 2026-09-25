@@ -1,0 +1,1429 @@
+diff --git a/cfg/config.go b/cfg/config.go
+index 4e4e3fb..44e510c 100644
+--- a/cfg/config.go
++++ b/cfg/config.go
+@@ -71,10 +71,12 @@ func (c *Config) Normalize() error {
+ }
+ 
+ type Rule struct {
++	Network     string   `json:"network,omitempty"`
+ 	SrcPort     string   `json:"srcPort,omitempty"`
+ 	DstPort     string   `json:"dstPort,omitempty"`
+ 	SrcIP       []string `json:"srcIP,omitempty"`
+ 	DstIP       []string `json:"dstIP,omitempty"`
++	DstDomain   []string `json:"dstDomain,omitempty"`
+ 	OutboundTag string   `json:"outboundTag"`
+ 
+ 	SrcPorts map[uint16]struct{}
+@@ -84,6 +86,10 @@ type Rule struct {
+ }
+ 
+ func (r *Rule) Normalize() (err error) {
++	r.Network = strings.ToLower(strings.TrimSpace(r.Network))
++	if r.Network != "" && r.Network != "tcp" && r.Network != "udp" {
++		return fmt.Errorf("network must be tcp or udp")
++	}
+ 	if r.SrcPorts, err = ParsePorts(r.SrcPort); err != nil {
+ 		return fmt.Errorf("srcPort: %w", err)
+ 	}
+@@ -96,6 +102,16 @@ func (r *Rule) Normalize() (err error) {
+ 	if r.DstIPs, err = ParseCIDRs(r.DstIP); err != nil {
+ 		return fmt.Errorf("dstIP: %w", err)
+ 	}
++	for i, domain := range r.DstDomain {
++		domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
++		if domain == "" || strings.ContainsAny(domain, " /:@") || !strings.Contains(domain, ".") {
++			return fmt.Errorf("dstDomain: invalid domain %q", domain)
++		}
++		r.DstDomain[i] = domain
++	}
++	if len(r.DstDomain) > 0 && len(r.DstPorts) == 0 {
++		return fmt.Errorf("dstDomain rules require a destination port")
++	}
+ 
+ 	return nil
+ }
+diff --git a/cfg/config_test.go b/cfg/config_test.go
+index 165476a..42cb8fa 100644
+--- a/cfg/config_test.go
++++ b/cfg/config_test.go
+@@ -144,6 +144,17 @@ func TestLoad(t *testing.T) {
+ 		assert.Contains(t, err.Error(), "dstPort")
+ 	})
+ 
++	t.Run("rejects an unknown transport", func(t *testing.T) {
++		path := write(t, `{
++			"routing": {"rules": [{"network": "quic", "dstPort": "443", "outboundTag": "proxy"}]},
++			"outbounds": [{"tag": "", "direct": {}}]
++		}`)
++
++		_, err := Load(path)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "network must be tcp or udp")
++	})
++
+ 	t.Run("rejects unknown fields", func(t *testing.T) {
+ 		path := write(t, `{
+ 			"pcap": {"network": "172.26.0.0/16", "localIP": "172.26.0.1"},
+diff --git a/engine/engine.go b/engine/engine.go
+index 8c0a97a..cacea47 100644
+--- a/engine/engine.go
++++ b/engine/engine.go
+@@ -38,17 +38,28 @@ type Options struct {
+ 	// Benchmarks use this to vary one stack setting at a time; production
+ 	// leaves it empty.
+ 	StackOptions []option.Option
++
++	// AfterCaptureOpen runs after the privileged live capture handle is open,
++	// but before the stack can accept frames or create outbound sockets. The
++	// macOS launcher uses this exact boundary to drop the process UID while
++	// retaining access to its already-open BPF descriptor.
++	AfterCaptureOpen func() error
++
++	// PolicyAuthorizer synchronously installs exact Discord destinations before
++	// the DNS answer is released to the console.
++	PolicyAuthorizer proxy.PolicyAuthorizer
+ }
+ 
+ // Engine is a running instance. Nothing about it is process wide - the only
+ // remaining process wide knob is tunnel.SetUDPSessionTimeout - so several can
+ // run side by side.
+ type Engine struct {
+-	Stack  *stack.Stack
+-	NicID  tcpip.NICID
+-	Device device.Device
+-	Proxy  proxy.Proxy
+-	Tunnel *tunnel.Tunnel
++	Stack   *stack.Stack
++	NicID   tcpip.NICID
++	Device  device.Device
++	Proxy   proxy.Proxy
++	Domains *proxy.DomainTracker
++	Tunnel  *tunnel.Tunnel
+ }
+ 
+ // Done is closed when the device stops reading frames. Callers that want to
+@@ -67,14 +78,15 @@ func Start(opts Options) (*Engine, error) {
+ 		return nil, fmt.Errorf("network config is required")
+ 	}
+ 
+-	router, err := buildProxy(opts.Config, opts.Interface.Name)
++	router, domains, err := buildProxy(opts.Config, opts.Interface.Name, opts.PolicyAuthorizer)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	e := &Engine{
+-		Proxy:  router,
+-		Tunnel: tunnel.New(router),
++		Proxy:   router,
++		Domains: domains,
++		Tunnel:  tunnel.New(router),
+ 	}
+ 
+ 	if opts.Source != nil {
+@@ -86,6 +98,13 @@ func Start(opts Options) (*Engine, error) {
+ 		e.Tunnel.Close()
+ 		return nil, fmt.Errorf("open device: %w", err)
+ 	}
++	if opts.AfterCaptureOpen != nil {
++		if err := opts.AfterCaptureOpen(); err != nil {
++			e.Device.Close()
++			e.Tunnel.Close()
++			return nil, fmt.Errorf("after capture open: %w", err)
++		}
++	}
+ 
+ 	s, nicID, err := core.NewStack(&core.Config{
+ 		TransportHandler: e.Tunnel,
+@@ -134,8 +153,13 @@ func (e *Engine) Close() error {
+ 	return nil
+ }
+ 
+-func buildProxy(config *cfg.Config, interfaceName string) (proxy.Proxy, error) {
++func buildProxy(config *cfg.Config, interfaceName string, authorizer proxy.PolicyAuthorizer) (proxy.Proxy, *proxy.DomainTracker, error) {
+ 	proxies := make(map[string]proxy.Proxy, len(config.Outbounds))
++	var roots []string
++	for _, rule := range config.Routing.Rules {
++		roots = append(roots, rule.DstDomain...)
++	}
++	domains := proxy.NewDomainTracker(roots)
+ 
+ 	for _, outbound := range config.Outbounds {
+ 		var (
+@@ -149,34 +173,34 @@ func buildProxy(config *cfg.Config, interfaceName string) (proxy.Proxy, error) {
+ 		case outbound.Socks != nil:
+ 			p, err = proxy.NewSocks5(outbound.Socks.Address, outbound.Socks.Username, outbound.Socks.Password)
+ 			if err != nil {
+-				return nil, fmt.Errorf("new socks5 error: %w", err)
++				return nil, nil, fmt.Errorf("new socks5 error: %w", err)
+ 			}
+ 		case outbound.Reject != nil:
+ 			p = proxy.NewReject()
+ 		case outbound.DNS != nil:
+-			p = proxy.NewDNS(config.DNS, interfaceName)
++			p = proxy.NewDNS(config.DNS, interfaceName, domains, authorizer)
+ 		default:
+-			return nil, fmt.Errorf("invalid outbound: %+v", outbound)
++			return nil, nil, fmt.Errorf("invalid outbound: %+v", outbound)
+ 		}
+ 
+ 		if _, dup := proxies[outbound.Tag]; dup {
+-			return nil, fmt.Errorf("duplicate outbound tag %q", outbound.Tag)
++			return nil, nil, fmt.Errorf("duplicate outbound tag %q", outbound.Tag)
+ 		}
+ 
+ 		proxies[outbound.Tag] = p
+ 	}
+ 
+ 	if _, ok := proxies[""]; !ok {
+-		return nil, fmt.Errorf("no default outbound: exactly one outbound must have an empty tag")
++		return nil, nil, fmt.Errorf("no default outbound: exactly one outbound must have an empty tag")
+ 	}
+ 
+ 	for _, rule := range config.Routing.Rules {
+ 		if _, ok := proxies[rule.OutboundTag]; !ok {
+-			return nil, fmt.Errorf("routing rule references unknown outbound %q", rule.OutboundTag)
++			return nil, nil, fmt.Errorf("routing rule references unknown outbound %q", rule.OutboundTag)
+ 		}
+ 	}
+ 
+ 	slog.Debug("outbounds ready", "count", len(proxies))
+ 
+-	return proxy.NewRouter(config.Routing.Rules, proxies), nil
++	return proxy.NewRouter(config.Routing.Rules, proxies, domains), domains, nil
+ }
+diff --git a/engine/engine_test.go b/engine/engine_test.go
+new file mode 100644
+index 0000000..380e7e7
+--- /dev/null
++++ b/engine/engine_test.go
+@@ -0,0 +1,61 @@
++package engine
++
++import (
++	"errors"
++	"net"
++	"testing"
++
++	"github.com/DaniilSokolyuk/go-pcap2socks/cfg"
++	"github.com/DaniilSokolyuk/go-pcap2socks/core/device"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func testOptions(t *testing.T, source *device.MemSource) Options {
++	t.Helper()
++	_, network, err := net.ParseCIDR("172.24.0.0/16")
++	require.NoError(t, err)
++	return Options{
++		Config: &cfg.Config{Outbounds: []cfg.Outbound{{
++			Direct: &cfg.OutboundDirect{},
++		}}},
++		Interface: net.Interface{Name: "mem0"},
++		Network: &device.NetworkConfig{
++			Network:  network,
++			LocalIP:  net.ParseIP("172.24.2.1"),
++			LocalMAC: net.HardwareAddr{0x02, 0, 0, 0, 0, 1},
++			MTU:      1486,
++		},
++		Source: source,
++	}
++}
++
++func TestAfterCaptureOpenRunsBeforeStartReturns(t *testing.T) {
++	source := device.NewMemSource(1)
++	opts := testOptions(t, source)
++	called := false
++	opts.AfterCaptureOpen = func() error {
++		called = true
++		return nil
++	}
++
++	eng, err := Start(opts)
++	require.NoError(t, err)
++	assert.True(t, called)
++	require.NoError(t, eng.Close())
++}
++
++func TestAfterCaptureOpenFailureClosesCapture(t *testing.T) {
++	source := device.NewMemSource(1)
++	opts := testOptions(t, source)
++	opts.AfterCaptureOpen = func() error { return errors.New("injected privilege failure") }
++
++	eng, err := Start(opts)
++	assert.Nil(t, eng)
++	require.ErrorContains(t, err, "after capture open: injected privilege failure")
++	select {
++	case <-source.Done():
++	default:
++		t.Fatal("capture source remained open after privilege callback failure")
++	}
++}
+diff --git a/main.go b/main.go
+index a04e27e..8d18559 100644
+--- a/main.go
++++ b/main.go
+@@ -7,18 +7,18 @@ import (
+ 	"fmt"
+ 	"log/slog"
+ 	"net"
+-	"net/http"
+-	_ "net/http/pprof"
+ 	"os"
+ 	"os/exec"
+ 	"os/signal"
+ 	"path"
+ 	"runtime"
+ 	"syscall"
++	"time"
+ 
+ 	"github.com/DaniilSokolyuk/go-pcap2socks/cfg"
+ 	"github.com/DaniilSokolyuk/go-pcap2socks/core/device"
+ 	"github.com/DaniilSokolyuk/go-pcap2socks/engine"
++	"github.com/DaniilSokolyuk/go-pcap2socks/proxy"
+ 	"github.com/jackpal/gateway"
+ )
+ 
+@@ -73,24 +73,38 @@ func run() error {
+ 	}
+ 	displayNetworkConfig(netConfig)
+ 
++	var policy *proxy.PolicyClient
++	if runtime.GOOS == "darwin" {
++		policy, err = proxy.NewPolicyClientFromEnv()
++		if err != nil {
++			return err
++		}
++		defer policy.Close()
++	}
+ 	eng, err := engine.Start(engine.Options{
+-		Config:    config,
+-		Interface: ifce,
+-		Network:   netConfig,
++		Config:           config,
++		Interface:        ifce,
++		Network:          netConfig,
++		AfterCaptureOpen: platformPrivilegeDrop(),
++		PolicyAuthorizer: policy,
+ 	})
+ 	if err != nil {
+ 		return err
+ 	}
+ 	defer eng.Close()
+-
+-	go func() {
+-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+-			_, _ = w.Write([]byte("Hello world!"))
+-		})
+-		if err := http.ListenAndServe(":8085", nil); err != nil {
+-			slog.Warn("debug http server stopped", slog.Any("err", err))
+-		}
+-	}()
++	if policy != nil {
++		go func() {
++			for {
++				refresh, err := proxy.BootstrapPolicy(config.DNS, ifce.Name, eng.Domains, policy)
++				if err != nil {
++					slog.Warn("Discord policy bootstrap retry", slog.Any("err", err))
++					time.Sleep(500 * time.Millisecond)
++					continue
++				}
++				time.Sleep(refresh)
++			}
++		}()
++	}
+ 
+ 	sig := make(chan os.Signal, 1)
+ 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+@@ -121,7 +135,7 @@ func setupLogging() {
+ 		}
+ 	}
+ 
+-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
++	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
+ }
+ 
+ // configPath returns the config file from the first argument, or config.json
+diff --git a/privilege_darwin.go b/privilege_darwin.go
+new file mode 100644
+index 0000000..d579b09
+--- /dev/null
++++ b/privilege_darwin.go
+@@ -0,0 +1,36 @@
++//go:build darwin
++
++package main
++
++import (
++	"fmt"
++	"os"
++	"syscall"
++)
++
++const runtimeUID = 65534
++
++// platformPrivilegeDrop is invoked only after libpcap has opened and
++// configured the BPF handle. No stack goroutine or outbound socket exists at
++// that point, so every direct connection is owned by runtimeUID while the
++// already-open capture descriptor remains usable.
++func platformPrivilegeDrop() func() error {
++	return func() error {
++		if os.Geteuid() != 0 {
++			return fmt.Errorf("root is required to open the macOS capture device")
++		}
++		if err := syscall.Setgroups([]int{runtimeUID}); err != nil {
++			return fmt.Errorf("set supplementary groups: %w", err)
++		}
++		if err := syscall.Setgid(runtimeUID); err != nil {
++			return fmt.Errorf("set runtime gid: %w", err)
++		}
++		if err := syscall.Setuid(runtimeUID); err != nil {
++			return fmt.Errorf("set runtime uid: %w", err)
++		}
++		if os.Geteuid() != runtimeUID || os.Getegid() != runtimeUID {
++			return fmt.Errorf("runtime identity did not change")
++		}
++		return nil
++	}
++}
+diff --git a/privilege_other.go b/privilege_other.go
+new file mode 100644
+index 0000000..f7259a4
+--- /dev/null
++++ b/privilege_other.go
+@@ -0,0 +1,8 @@
++//go:build !darwin
++
++package main
++
++// Other platforms retain their existing service/process confinement model.
++func platformPrivilegeDrop() func() error {
++	return nil
++}
+diff --git a/proxy/dns.go b/proxy/dns.go
+index ae99469..e607a85 100644
+--- a/proxy/dns.go
++++ b/proxy/dns.go
+@@ -22,6 +22,9 @@ type DNS struct {
+ 	cfg           cfg.DNS
+ 	dnsClient     *dns.Client
+ 	interfaceName string
++	domains       *DomainTracker
++	authorizer    PolicyAuthorizer
++	discordDNS    dnsExchanger
+ }
+ 
+ func (d *DNS) Addr() string {
+@@ -32,7 +35,7 @@ func (d *DNS) Mode() Mode {
+ 	return ModeDNS
+ }
+ 
+-func NewDNS(cfg cfg.DNS, interfaceName string) *DNS {
++func NewDNS(cfg cfg.DNS, interfaceName string, domains *DomainTracker, authorizer PolicyAuthorizer) *DNS {
+ 	dnsClient := new(dns.Client)
+ 	dnsClient.UDPSize = math.MaxUint16
+ 
+@@ -40,6 +43,9 @@ func NewDNS(cfg cfg.DNS, interfaceName string) *DNS {
+ 		dnsClient:     dnsClient,
+ 		cfg:           cfg,
+ 		interfaceName: interfaceName,
++		domains:       domains,
++		authorizer:    authorizer,
++		discordDNS:    newDiscordDoHClient(),
+ 	}
+ }
+ 
+@@ -56,6 +62,9 @@ func (d *DNS) DialUDP(m *M.Metadata) (net.PacketConn, error) {
+ 		done:          make(chan struct{}),
+ 		readDeadline:  pipe.MakeDeadline(),
+ 		interfaceName: d.interfaceName,
++		domains:       d.domains,
++		authorizer:    d.authorizer,
++		discordDNS:    d.discordDNS,
+ 	}, nil
+ }
+ 
+@@ -65,6 +74,9 @@ type dnsConn struct {
+ 	m             *M.Metadata
+ 	cfg           cfg.DNS
+ 	interfaceName string
++	domains       *DomainTracker
++	authorizer    PolicyAuthorizer
++	discordDNS    dnsExchanger
+ 
+ 	done         chan struct{}
+ 	closeOnce    sync.Once
+@@ -104,6 +116,15 @@ func (d *dnsConn) WriteTo(b []byte, _ net.Addr) (n int, err error) {
+ // ReadFrom. It always returns once the connection is closed, so a session that
+ // goes away mid-query does not leak this goroutine.
+ func (d *dnsConn) exchange(msg *dns.Msg) {
++	if d.domains != nil && d.domains.MatchesQuestion(msg) {
++		response, err := d.discordDNS.Exchange(msg)
++		if err != nil {
++			slog.Error("Discord DoH exchange failed", slog.Any("err", err))
++			return
++		}
++		d.deliver(msg, response)
++		return
++	}
+ 	var lastErr error
+ 
+ 	for _, server := range d.cfg.Servers {
+@@ -124,10 +145,7 @@ func (d *dnsConn) exchange(msg *dns.Msg) {
+ 			}
+ 		}
+ 
+-		select {
+-		case d.answerCh <- response:
+-		case <-d.done:
+-		}
++		d.deliver(msg, response)
+ 		return
+ 	}
+ 
+@@ -136,6 +154,30 @@ func (d *dnsConn) exchange(msg *dns.Msg) {
+ 	}
+ }
+ 
++func (d *dnsConn) deliver(query, response *dns.Msg) {
++	select {
++	case <-d.done:
++		return
++	default:
++	}
++	response.Id = query.Id
++	if d.domains != nil && d.domains.Learn(response) {
++		if d.authorizer == nil {
++			slog.Error("Discord DNS policy has no authorizer")
++			return
++		}
++		if err := d.authorizer.Sync(d.domains); err != nil {
++			slog.Error("Discord DNS policy was not installed", slog.Any("err", err))
++			_ = d.authorizer.Close()
++			return
++		}
++	}
++	select {
++	case d.answerCh <- response:
++	case <-d.done:
++	}
++}
++
+ func (d *dnsConn) Close() error {
+ 	d.closeOnce.Do(func() {
+ 		close(d.done)
+diff --git a/proxy/doh.go b/proxy/doh.go
+new file mode 100644
+index 0000000..af16628
+--- /dev/null
++++ b/proxy/doh.go
+@@ -0,0 +1,111 @@
++package proxy
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"time"
++
++	"github.com/miekg/dns"
++)
++
++const maxDNSMessageBytes = 65_535
++
++var discordDoHEndpoints = []string{
++	"https://cloudflare-dns.com/dns-query",
++	"https://dns.google/dns-query",
++}
++
++type dnsExchanger interface {
++	Exchange(*dns.Msg) (*dns.Msg, error)
++}
++
++type dohClient struct {
++	client    *http.Client
++	endpoints []string
++}
++
++func newDiscordDoHClient() dnsExchanger {
++	// Keep both fallback attempts inside the helper's bounded startup window.
++	// A transient endpoint failure is retried by the policy bootstrap loop.
++	dialer := &net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}
++	return &dohClient{
++		client: &http.Client{
++			Timeout: 4 * time.Second,
++			Transport: &http.Transport{
++				Proxy: nil,
++				DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
++					return dialer.DialContext(ctx, "tcp4", address)
++				},
++				ForceAttemptHTTP2:   true,
++				TLSHandshakeTimeout: 3 * time.Second,
++			},
++		},
++		endpoints: append([]string(nil), discordDoHEndpoints...),
++	}
++}
++
++func (d *dohClient) Exchange(message *dns.Msg) (*dns.Msg, error) {
++	if message == nil || len(message.Question) != 1 {
++		return nil, fmt.Errorf("Discord DoH requires exactly one question")
++	}
++	query := message.Copy()
++	query.Id = 0
++	wire, err := query.Pack()
++	if err != nil {
++		return nil, fmt.Errorf("pack Discord DoH query: %w", err)
++	}
++	var lastErr error
++	for _, endpoint := range d.endpoints {
++		request, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(wire))
++		if err != nil {
++			return nil, fmt.Errorf("create Discord DoH request: %w", err)
++		}
++		request.Header.Set("Accept", "application/dns-message")
++		request.Header.Set("Content-Type", "application/dns-message")
++		response, err := d.client.Do(request)
++		if err != nil {
++			lastErr = err
++			continue
++		}
++		body, readErr := io.ReadAll(io.LimitReader(response.Body, maxDNSMessageBytes+1))
++		closeErr := response.Body.Close()
++		if readErr != nil {
++			lastErr = readErr
++			continue
++		}
++		if closeErr != nil {
++			lastErr = closeErr
++			continue
++		}
++		if response.StatusCode < 200 || response.StatusCode >= 300 {
++			lastErr = fmt.Errorf("Discord DoH returned HTTP %d", response.StatusCode)
++			continue
++		}
++		if len(body) > maxDNSMessageBytes {
++			lastErr = fmt.Errorf("Discord DoH response exceeds size limit")
++			continue
++		}
++		answer := new(dns.Msg)
++		if err := answer.Unpack(body); err != nil {
++			lastErr = err
++			continue
++		}
++		if !answer.Response || answer.Opcode != query.Opcode || len(answer.Question) != 1 ||
++			answer.Question[0].Name != query.Question[0].Name ||
++			answer.Question[0].Qtype != query.Question[0].Qtype ||
++			answer.Question[0].Qclass != query.Question[0].Qclass {
++			lastErr = fmt.Errorf("Discord DoH response does not match the question")
++			continue
++		}
++		answer.Id = message.Id
++		return answer, nil
++	}
++	if lastErr == nil {
++		lastErr = fmt.Errorf("no Discord DoH endpoints configured")
++	}
++	return nil, lastErr
++}
+diff --git a/proxy/doh_test.go b/proxy/doh_test.go
+new file mode 100644
+index 0000000..5f7276c
+--- /dev/null
++++ b/proxy/doh_test.go
+@@ -0,0 +1,65 @@
++package proxy
++
++import (
++	"crypto/tls"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/miekg/dns"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestDiscordDoHPreservesQuestionAndCallerID(t *testing.T) {
++	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		require.Equal(t, http.MethodPost, request.Method)
++		require.Equal(t, "application/dns-message", request.Header.Get("Content-Type"))
++		wire, err := io.ReadAll(request.Body)
++		require.NoError(t, err)
++		query := new(dns.Msg)
++		require.NoError(t, query.Unpack(wire))
++		answer := new(dns.Msg)
++		answer.SetReply(query)
++		answer.Answer = []dns.RR{&dns.A{
++			Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
++			A:   net.IPv4(203, 0, 113, 42),
++		}}
++		response, err := answer.Pack()
++		require.NoError(t, err)
++		writer.Header().Set("Content-Type", "application/dns-message")
++		_, err = writer.Write(response)
++		require.NoError(t, err)
++	}))
++	defer server.Close()
++	transport := server.Client().Transport.(*http.Transport).Clone()
++	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // test server only
++	client := &dohClient{client: &http.Client{Transport: transport}, endpoints: []string{server.URL}}
++	query := new(dns.Msg)
++	query.SetQuestion("discord.com.", dns.TypeA)
++	query.Id = 4242
++	response, err := client.Exchange(query)
++	require.NoError(t, err)
++	assert.Equal(t, uint16(4242), response.Id)
++	require.Len(t, response.Answer, 1)
++}
++
++func TestDomainTrackerMatchesOnlyDiscordAddressQuestions(t *testing.T) {
++	tracker := NewDomainTracker([]string{"discord.com"})
++	for _, test := range []struct {
++		name  string
++		qtype uint16
++		want  bool
++	}{
++		{"discord.com.", dns.TypeA, true},
++		{"gateway.discord.com.", dns.TypeAAAA, true},
++		{"example.com.", dns.TypeA, false},
++		{"discord.com.", dns.TypeTXT, false},
++	} {
++		message := new(dns.Msg)
++		message.SetQuestion(test.name, test.qtype)
++		assert.Equal(t, test.want, tracker.MatchesQuestion(message))
++	}
++}
+diff --git a/proxy/domain_tracker.go b/proxy/domain_tracker.go
+new file mode 100644
+index 0000000..b027d7c
+--- /dev/null
++++ b/proxy/domain_tracker.go
+@@ -0,0 +1,194 @@
++package proxy
++
++import (
++	"net"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/miekg/dns"
++)
++
++// DomainTracker records short-lived IP authority only from DNS answers whose
++// question belongs to the configured service roots. It never turns unrelated
++// answers in the same packet into routing authority.
++type DomainTracker struct {
++	mu     sync.Mutex
++	roots  []string
++	leases map[string]DomainLease
++}
++
++type DomainLease struct {
++	Address string `json:"address"`
++	Domain  string `json:"domain"`
++	TTL     uint32 `json:"ttl"`
++	expires time.Time
++}
++
++func NewDomainTracker(roots []string) *DomainTracker {
++	normalized := make([]string, 0, len(roots))
++	for _, root := range roots {
++		root = normalizeDomain(root)
++		if root != "" {
++			normalized = append(normalized, root)
++		}
++	}
++	return &DomainTracker{roots: normalized, leases: make(map[string]DomainLease)}
++}
++
++func (d *DomainTracker) Roots() []string {
++	if d == nil {
++		return nil
++	}
++	return append([]string(nil), d.roots...)
++}
++
++func normalizeDomain(name string) string {
++	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
++}
++
++func (d *DomainTracker) allowed(name string) bool {
++	name = normalizeDomain(name)
++	for _, root := range d.roots {
++		if name == root || strings.HasSuffix(name, "."+root) {
++			return true
++		}
++	}
++	return false
++}
++
++func (d *DomainTracker) MatchesQuestion(message *dns.Msg) bool {
++	if d == nil || message == nil || len(message.Question) != 1 {
++		return false
++	}
++	question := message.Question[0]
++	return question.Qclass == dns.ClassINET &&
++		(question.Qtype == dns.TypeA || question.Qtype == dns.TypeAAAA) &&
++		d.allowed(question.Name)
++}
++
++func (d *DomainTracker) Learn(message *dns.Msg) bool {
++	if d == nil || message == nil {
++		return false
++	}
++	allowed := make(map[string]struct{})
++	authorityDomain := ""
++	for _, question := range message.Question {
++		if d.allowed(question.Name) {
++			domain := normalizeDomain(question.Name)
++			allowed[domain] = struct{}{}
++			if authorityDomain == "" {
++				authorityDomain = domain
++			}
++		}
++	}
++	if len(allowed) == 0 {
++		return false
++	}
++
++	// Follow only CNAMEs reachable from an allowed question. Multiple passes
++	// handle responses whose records are not ordered by chain position.
++	for range message.Answer {
++		changed := false
++		for _, answer := range message.Answer {
++			cname, ok := answer.(*dns.CNAME)
++			if !ok {
++				continue
++			}
++			if _, ok := allowed[normalizeDomain(cname.Hdr.Name)]; ok {
++				target := normalizeDomain(cname.Target)
++				if _, seen := allowed[target]; !seen {
++					allowed[target] = struct{}{}
++					changed = true
++				}
++			}
++		}
++		if !changed {
++			break
++		}
++	}
++
++	now := time.Now()
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	for address, lease := range d.leases {
++		if !lease.expires.After(now) {
++			delete(d.leases, address)
++		}
++	}
++	learned := false
++	for _, answer := range message.Answer {
++		if _, ok := allowed[normalizeDomain(answer.Header().Name)]; !ok {
++			continue
++		}
++		record, ok := answer.(*dns.A)
++		if !ok {
++			continue
++		}
++		address := record.A.To4()
++		if answer.Header().Ttl == 0 || address == nil {
++			continue
++		}
++		ttl := answer.Header().Ttl
++		if ttl > 120 {
++			ttl = 120
++		}
++		key := authorityDomain + "\x00" + address.String()
++		d.leases[key] = DomainLease{
++			Address: address.String(),
++			Domain:  authorityDomain,
++			TTL:     ttl,
++			expires: now.Add(time.Duration(ttl) * time.Second),
++		}
++		learned = true
++	}
++	return learned
++}
++
++func (d *DomainTracker) Snapshot() []DomainLease {
++	if d == nil {
++		return nil
++	}
++	now := time.Now()
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	result := make([]DomainLease, 0, len(d.leases))
++	for address, lease := range d.leases {
++		if !lease.expires.After(now) {
++			delete(d.leases, address)
++			continue
++		}
++		ip := net.ParseIP(lease.Address)
++		if ip == nil || ip.To4() == nil {
++			continue
++		}
++		remaining := uint32(time.Until(lease.expires).Seconds())
++		if remaining == 0 {
++			remaining = 1
++		}
++		lease.TTL = remaining
++		lease.expires = time.Time{}
++		result = append(result, lease)
++	}
++	return result
++}
++
++func (d *DomainTracker) Contains(address net.IP) bool {
++	if d == nil || address == nil {
++		return false
++	}
++	now := time.Now()
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	wanted := address.String()
++	for key, lease := range d.leases {
++		if !lease.expires.After(now) {
++			delete(d.leases, key)
++			continue
++		}
++		if lease.Address == wanted {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/proxy/domain_tracker_test.go b/proxy/domain_tracker_test.go
+new file mode 100644
+index 0000000..2413136
+--- /dev/null
++++ b/proxy/domain_tracker_test.go
+@@ -0,0 +1,54 @@
++package proxy
++
++import (
++	"net"
++	"testing"
++
++	"github.com/miekg/dns"
++	"github.com/stretchr/testify/assert"
++)
++
++func TestDomainTrackerLearnsAllowedAnswersAndCNAMEsOnly(t *testing.T) {
++	tracker := NewDomainTracker([]string{"discord.com"})
++	message := new(dns.Msg)
++	message.SetQuestion("gateway.discord.com.", dns.TypeA)
++	message.Answer = []dns.RR{
++		&dns.CNAME{
++			Hdr:    dns.RR_Header{Name: "gateway.discord.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 60},
++			Target: "edge.example.net.",
++		},
++		&dns.A{
++			Hdr: dns.RR_Header{Name: "edge.example.net.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
++			A:   net.ParseIP("203.0.113.20"),
++		},
++		&dns.A{
++			Hdr: dns.RR_Header{Name: "unrelated.example.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
++			A:   net.ParseIP("203.0.113.21"),
++		},
++	}
++
++	assert.True(t, tracker.Learn(message))
++	assert.True(t, tracker.Contains(net.ParseIP("203.0.113.20")))
++	assert.False(t, tracker.Contains(net.ParseIP("203.0.113.21")))
++}
++
++func TestDomainTrackerRejectsUnrelatedQuestionAndZeroTTL(t *testing.T) {
++	tracker := NewDomainTracker([]string{"discord.com"})
++	for _, test := range []struct {
++		question string
++		ttl      uint32
++		address  string
++	}{
++		{question: "example.com.", ttl: 60, address: "203.0.113.30"},
++		{question: "discord.com.", ttl: 0, address: "203.0.113.31"},
++	} {
++		message := new(dns.Msg)
++		message.SetQuestion(test.question, dns.TypeA)
++		message.Answer = []dns.RR{&dns.A{
++			Hdr: dns.RR_Header{Name: test.question, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: test.ttl},
++			A:   net.ParseIP(test.address),
++		}}
++		assert.False(t, tracker.Learn(message))
++		assert.False(t, tracker.Contains(net.ParseIP(test.address)))
++	}
++}
+diff --git a/proxy/outbound_test.go b/proxy/outbound_test.go
+index 5f6baa3..19b3bd9 100644
+--- a/proxy/outbound_test.go
++++ b/proxy/outbound_test.go
+@@ -175,7 +175,7 @@ func TestDNSOutbound(t *testing.T) {
+ 
+ 	p := NewDNS(cfg.DNS{Servers: []struct {
+ 		Address string `json:"address"`
+-	}{{Address: upstream}}}, "")
++	}{{Address: upstream}}}, "", nil, nil)
+ 
+ 	md := &M.Metadata{Network: M.UDP, DstIP: net.IPv4(1, 1, 1, 1), DstPort: 53}
+ 	pc, err := p.DialUDP(md)
+@@ -206,7 +206,7 @@ func TestDNSOutbound(t *testing.T) {
+ // TestDNSOutboundReadDeadline pins the fix for the connection that used to
+ // ignore deadlines and block forever when no answer arrived.
+ func TestDNSOutboundReadDeadline(t *testing.T) {
+-	p := NewDNS(cfg.DNS{}, "")
++	p := NewDNS(cfg.DNS{}, "", nil, nil)
+ 
+ 	pc, err := p.DialUDP(&M.Metadata{Network: M.UDP, DstIP: net.IPv4(1, 1, 1, 1), DstPort: 53})
+ 	require.NoError(t, err)
+@@ -223,7 +223,7 @@ func TestDNSOutboundReadDeadline(t *testing.T) {
+ // TestDNSOutboundCloseUnblocksRead checks closing the session wakes a pending
+ // reader instead of stranding it.
+ func TestDNSOutboundCloseUnblocksRead(t *testing.T) {
+-	p := NewDNS(cfg.DNS{}, "")
++	p := NewDNS(cfg.DNS{}, "", nil, nil)
+ 
+ 	pc, err := p.DialUDP(&M.Metadata{Network: M.UDP, DstIP: net.IPv4(1, 1, 1, 1), DstPort: 53})
+ 	require.NoError(t, err)
+diff --git a/proxy/policy.go b/proxy/policy.go
+new file mode 100644
+index 0000000..cca35bf
+--- /dev/null
++++ b/proxy/policy.go
+@@ -0,0 +1,161 @@
++package proxy
++
++import (
++	"bufio"
++	"encoding/json"
++	"fmt"
++	"net"
++	"os"
++	"strconv"
++	"sync"
++	"time"
++
++	"github.com/DaniilSokolyuk/go-pcap2socks/cfg"
++	"github.com/miekg/dns"
++)
++
++const policyVersion = 1
++
++type PolicyAuthorizer interface {
++	Sync(*DomainTracker) error
++	Close() error
++}
++
++type policyUpdate struct {
++	Version    uint32        `json:"version"`
++	Type       string        `json:"type"`
++	Generation uint64        `json:"generation"`
++	Domains    []string      `json:"domains"`
++	Leases     []DomainLease `json:"leases"`
++}
++
++type policyAck struct {
++	Version    uint32 `json:"version"`
++	Generation uint64 `json:"generation"`
++	OK         bool   `json:"ok"`
++	Error      string `json:"error,omitempty"`
++}
++
++type PolicyClient struct {
++	mu         sync.Mutex
++	conn       net.Conn
++	reader     *bufio.Reader
++	generation uint64
++}
++
++func NewPolicyClientFromEnv() (*PolicyClient, error) {
++	raw := os.Getenv("KONSOLLINK_POLICY_FD")
++	if raw == "" {
++		return nil, fmt.Errorf("KONSOLLINK_POLICY_FD is required")
++	}
++	fd, err := strconv.Atoi(raw)
++	if err != nil || fd < 3 {
++		return nil, fmt.Errorf("invalid KONSOLLINK_POLICY_FD")
++	}
++	file := os.NewFile(uintptr(fd), "konsollink-policy")
++	if file == nil {
++		return nil, fmt.Errorf("open policy descriptor")
++	}
++	conn, err := net.FileConn(file)
++	_ = file.Close()
++	if err != nil {
++		return nil, fmt.Errorf("open policy connection: %w", err)
++	}
++	return &PolicyClient{conn: conn, reader: bufio.NewReaderSize(conn, 8192)}, nil
++}
++
++func (p *PolicyClient) Close() error { return p.conn.Close() }
++
++func (p *PolicyClient) Sync(tracker *DomainTracker) error {
++	if p == nil || tracker == nil {
++		return fmt.Errorf("policy synchronization is unavailable")
++	}
++	leases := tracker.Snapshot()
++	if len(leases) == 0 {
++		return nil
++	}
++	if len(leases) > 64 {
++		return fmt.Errorf("policy destination limit exceeded")
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.generation++
++	update := policyUpdate{
++		Version: policyVersion, Type: "discord_dns", Generation: p.generation,
++		Domains: tracker.Roots(), Leases: leases,
++	}
++	if err := p.conn.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
++		return err
++	}
++	if err := json.NewEncoder(p.conn).Encode(update); err != nil {
++		return fmt.Errorf("send policy update: %w", err)
++	}
++	line, err := p.reader.ReadBytes('\n')
++	if err != nil {
++		return fmt.Errorf("read policy acknowledgement: %w", err)
++	}
++	if len(line) > 4096 {
++		return fmt.Errorf("policy acknowledgement size limit")
++	}
++	var ack policyAck
++	if err := json.Unmarshal(line, &ack); err != nil {
++		return fmt.Errorf("decode policy acknowledgement: %w", err)
++	}
++	if ack.Version != policyVersion || ack.Generation != p.generation || !ack.OK {
++		return fmt.Errorf("policy update rejected: %s", ack.Error)
++	}
++	return nil
++}
++
++func BootstrapPolicy(config cfg.DNS, _ string, tracker *DomainTracker, authorizer PolicyAuthorizer) (time.Duration, error) {
++	if tracker == nil || authorizer == nil {
++		return 0, fmt.Errorf("policy bootstrap is unavailable")
++	}
++	if len(config.Servers) != 1 || config.Servers[0].Address != "local" {
++		return 0, fmt.Errorf("Discord policy bootstrap requires the local DNS resolver")
++	}
++	client := newDiscordDoHClient()
++	resolved := 0
++	var lastErr error
++	for _, root := range []string{"discord.com", "gateway.discord.gg"} {
++		if !tracker.allowed(root) {
++			return 0, fmt.Errorf("Discord policy bootstrap root %q is missing", root)
++		}
++		message := new(dns.Msg)
++		message.SetQuestion(dns.Fqdn(root), dns.TypeA)
++		response, err := client.Exchange(message)
++		if err != nil {
++			lastErr = fmt.Errorf("%s: %w", root, err)
++			continue
++		}
++		if !tracker.Learn(response) {
++			lastErr = fmt.Errorf("%s: response contained no approved IPv4 answer", root)
++			continue
++		}
++		resolved++
++	}
++	if resolved != 2 {
++		if lastErr == nil {
++			lastErr = fmt.Errorf("incomplete Discord DNS response")
++		}
++		return 0, fmt.Errorf("Discord policy bootstrap failed: %w", lastErr)
++	}
++	if err := authorizer.Sync(tracker); err != nil {
++		return 0, err
++	}
++	return policyRefreshInterval(tracker.Snapshot()), nil
++}
++
++func policyRefreshInterval(leases []DomainLease) time.Duration {
++	refresh := 45 * time.Second
++	for _, lease := range leases {
++		candidate := time.Duration(lease.TTL) * time.Second / 2
++		if candidate < refresh {
++			refresh = candidate
++		}
++	}
++	if refresh < 5*time.Second {
++		refresh = 5 * time.Second
++	}
++	return refresh
++}
+diff --git a/proxy/policy_test.go b/proxy/policy_test.go
+new file mode 100644
+index 0000000..bf3aa19
+--- /dev/null
++++ b/proxy/policy_test.go
+@@ -0,0 +1,112 @@
++package proxy
++
++import (
++	"bufio"
++	"encoding/json"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/DaniilSokolyuk/go-pcap2socks/cfg"
++	M "github.com/DaniilSokolyuk/go-pcap2socks/md"
++	"github.com/miekg/dns"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestPolicySyncCarriesBoundedDiscordDNSAuthority(t *testing.T) {
++	tracker := NewDomainTracker([]string{"discord.com"})
++	answer := new(dns.Msg)
++	answer.SetQuestion("gateway.discord.com.", dns.TypeA)
++	answer.Answer = []dns.RR{&dns.A{
++		Hdr: dns.RR_Header{Name: "gateway.discord.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 600},
++		A:   net.IPv4(203, 0, 113, 25),
++	}}
++	tracker.Learn(answer)
++
++	clientConn, serverConn := net.Pipe()
++	client := &PolicyClient{conn: clientConn, reader: bufio.NewReaderSize(clientConn, 8192)}
++	done := make(chan error, 1)
++	go func() {
++		defer serverConn.Close()
++		line, err := bufio.NewReader(serverConn).ReadBytes('\n')
++		if err != nil {
++			done <- err
++			return
++		}
++		var update policyUpdate
++		if err := json.Unmarshal(line, &update); err != nil {
++			done <- err
++			return
++		}
++		assert.Equal(t, uint32(1), update.Version)
++		assert.Equal(t, "discord_dns", update.Type)
++		require.Len(t, update.Leases, 1)
++		assert.Equal(t, "gateway.discord.com", update.Leases[0].Domain)
++		assert.LessOrEqual(t, update.Leases[0].TTL, uint32(120))
++		done <- json.NewEncoder(serverConn).Encode(policyAck{
++			Version: 1, Generation: update.Generation, OK: true,
++		})
++	}()
++	require.NoError(t, client.Sync(tracker))
++	require.NoError(t, <-done)
++	require.NoError(t, client.Close())
++}
++
++func TestPolicyRefreshPrecedesTheShortestLeaseExpiry(t *testing.T) {
++	assert.Equal(t, 17*time.Second, policyRefreshInterval([]DomainLease{{TTL: 120}, {TTL: 34}}))
++	assert.Equal(t, 5*time.Second, policyRefreshInterval([]DomainLease{{TTL: 3}}))
++	assert.Equal(t, 45*time.Second, policyRefreshInterval([]DomainLease{{TTL: 120}}))
++}
++
++type gateAuthorizer struct {
++	entered chan struct{}
++	release chan struct{}
++}
++
++func (g *gateAuthorizer) Sync(*DomainTracker) error {
++	close(g.entered)
++	<-g.release
++	return nil
++}
++func (g *gateAuthorizer) Close() error { return nil }
++
++type dnsExchangeFunc func(*dns.Msg) (*dns.Msg, error)
++
++func (f dnsExchangeFunc) Exchange(message *dns.Msg) (*dns.Msg, error) { return f(message) }
++
++func TestDNSAnswerWaitsForPolicyAcknowledgement(t *testing.T) {
++	upstream := startDNSServer(t, net.IPv4(203, 0, 113, 26))
++	tracker := NewDomainTracker([]string{"discord.com"})
++	gate := &gateAuthorizer{entered: make(chan struct{}), release: make(chan struct{})}
++	config := cfg.DNS{Servers: []struct {
++		Address string `json:"address"`
++	}{{Address: upstream}}}
++	metadata := &M.Metadata{Network: M.UDP, DstIP: net.IPv4(1, 1, 1, 1), DstPort: 53}
++	p := NewDNS(config, "", tracker, gate)
++	p.discordDNS = dnsExchangeFunc(func(message *dns.Msg) (*dns.Msg, error) {
++		response, _, err := new(dns.Client).Exchange(message, upstream)
++		return response, err
++	})
++	pc, err := p.DialUDP(metadata)
++	require.NoError(t, err)
++	defer pc.Close()
++	query := new(dns.Msg)
++	query.SetQuestion("discord.com.", dns.TypeA)
++	packed, err := query.Pack()
++	require.NoError(t, err)
++	_, err = pc.WriteTo(packed, metadata.UDPAddr())
++	require.NoError(t, err)
++	select {
++	case <-gate.entered:
++	case <-time.After(2 * time.Second):
++		t.Fatal("policy authorizer was not called")
++	}
++	require.NoError(t, pc.SetReadDeadline(time.Now().Add(50*time.Millisecond)))
++	_, _, err = pc.ReadFrom(make([]byte, 4096))
++	require.Error(t, err)
++	close(gate.release)
++	require.NoError(t, pc.SetReadDeadline(time.Now().Add(2*time.Second)))
++	_, _, err = pc.ReadFrom(make([]byte, 4096))
++	require.NoError(t, err)
++}
+diff --git a/proxy/router.go b/proxy/router.go
+index a2c1727..a7d507e 100644
+--- a/proxy/router.go
++++ b/proxy/router.go
+@@ -15,12 +15,14 @@ type Router struct {
+ 	*Base
+ 	Rules   []cfg.Rule
+ 	Proxies map[string]Proxy
++	Domains *DomainTracker
+ }
+ 
+-func NewRouter(rules []cfg.Rule, proxies map[string]Proxy) *Router {
++func NewRouter(rules []cfg.Rule, proxies map[string]Proxy, domains *DomainTracker) *Router {
+ 	return &Router{
+ 		Rules:   rules,
+ 		Proxies: proxies,
++		Domains: domains,
+ 		Base: &Base{
+ 			mode: ModeRouter,
+ 		},
+@@ -29,7 +31,7 @@ func NewRouter(rules []cfg.Rule, proxies map[string]Proxy) *Router {
+ 
+ func (d *Router) DialContext(ctx context.Context, metadata *M.Metadata) (net.Conn, error) {
+ 	for _, rule := range d.Rules {
+-		if match(metadata, rule) {
++		if d.match(metadata, rule) {
+ 			if proxy, ok := d.Proxies[rule.OutboundTag]; ok {
+ 				return proxy.DialContext(ctx, metadata)
+ 			}
+@@ -43,7 +45,7 @@ func (d *Router) DialContext(ctx context.Context, metadata *M.Metadata) (net.Con
+ 
+ func (d *Router) DialUDP(metadata *M.Metadata) (net.PacketConn, error) {
+ 	for _, rule := range d.Rules {
+-		if match(metadata, rule) {
++		if d.match(metadata, rule) {
+ 			if proxy, ok := d.Proxies[rule.OutboundTag]; ok {
+ 				return proxy.DialUDP(metadata)
+ 			}
+@@ -55,7 +57,13 @@ func (d *Router) DialUDP(metadata *M.Metadata) (net.PacketConn, error) {
+ 	return d.Proxies[""].DialUDP(metadata)
+ }
+ 
+-func match(metadata *M.Metadata, rule cfg.Rule) bool {
++func (d *Router) match(metadata *M.Metadata, rule cfg.Rule) bool {
++	if rule.Network != "" && rule.Network != metadata.Network.String() {
++		return false
++	}
++	if len(rule.DstDomain) > 0 && (d.Domains == nil || !d.Domains.Contains(metadata.DstIP)) {
++		return false
++	}
+ 	if _, ok := rule.SrcPorts[metadata.SrcPort]; ok {
+ 		return true
+ 	}
+diff --git a/proxy/router_test.go b/proxy/router_test.go
+index b2ab6d9..a828a14 100644
+--- a/proxy/router_test.go
++++ b/proxy/router_test.go
+@@ -7,6 +7,7 @@ import (
+ 
+ 	"github.com/DaniilSokolyuk/go-pcap2socks/cfg"
+ 	M "github.com/DaniilSokolyuk/go-pcap2socks/md"
++	"github.com/miekg/dns"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ )
+@@ -118,7 +119,7 @@ func TestRouterSelectsOutbound(t *testing.T) {
+ 				"hit": &recordingProxy{Base: &Base{}, tag: "hit", picked: &picked},
+ 			}
+ 
+-			router := NewRouter([]cfg.Rule{mustRule(t, tc.rule)}, proxies)
++			router := NewRouter([]cfg.Rule{mustRule(t, tc.rule)}, proxies, nil)
+ 
+ 			_, err := router.DialContext(context.Background(), tc.md)
+ 			require.NoError(t, err)
+@@ -143,13 +144,65 @@ func TestRouterFirstMatchWins(t *testing.T) {
+ 	router := NewRouter([]cfg.Rule{
+ 		mustRule(t, cfg.Rule{DstPort: "443", OutboundTag: "first"}),
+ 		mustRule(t, cfg.Rule{DstPort: "443", OutboundTag: "second"}),
+-	}, proxies)
++	}, proxies, nil)
+ 
+ 	_, err := router.DialContext(context.Background(), metadata("172.26.0.5", 40000, "1.1.1.1", 443))
+ 	require.NoError(t, err)
+ 	assert.Equal(t, "first", picked)
+ }
+ 
++func TestRouterNetworkCriterionKeepsUDPDirect(t *testing.T) {
++	var picked string
++	proxies := map[string]Proxy{
++		"":      &recordingProxy{Base: &Base{}, tag: "direct", picked: &picked},
++		"socks": &recordingProxy{Base: &Base{}, tag: "socks", picked: &picked},
++	}
++	router := NewRouter([]cfg.Rule{
++		mustRule(t, cfg.Rule{Network: "tcp", DstPort: "80,443", OutboundTag: "socks"}),
++	}, proxies, nil)
++
++	tcp := metadata("172.26.0.5", 40000, "1.1.1.1", 443)
++	_, err := router.DialContext(context.Background(), tcp)
++	require.NoError(t, err)
++	assert.Equal(t, "socks", picked)
++
++	picked = ""
++	udp := metadata("172.26.0.5", 40000, "1.1.1.1", 443)
++	udp.Network = M.UDP
++	_, err = router.DialUDP(udp)
++	require.NoError(t, err)
++	assert.Equal(t, "direct", picked)
++}
++
++func TestRouterDomainRuleKeepsUnlearnedTCPDirect(t *testing.T) {
++	var picked string
++	proxies := map[string]Proxy{
++		"":      &recordingProxy{Base: &Base{}, tag: "direct", picked: &picked},
++		"socks": &recordingProxy{Base: &Base{}, tag: "socks", picked: &picked},
++	}
++	tracker := NewDomainTracker([]string{"discord.net"})
++	router := NewRouter([]cfg.Rule{
++		mustRule(t, cfg.Rule{Network: "tcp", DstPort: "80,443", DstDomain: []string{"discord.net"}, OutboundTag: "socks"}),
++	}, proxies, tracker)
++	destination := net.ParseIP("203.0.113.77")
++	flow := metadata("172.26.0.5", 40000, destination.String(), 443)
++	_, err := router.DialContext(context.Background(), flow)
++	require.NoError(t, err)
++	assert.Equal(t, "direct", picked)
++
++	answer := new(dns.Msg)
++	answer.SetQuestion("gateway.discord.net.", dns.TypeA)
++	answer.Answer = []dns.RR{&dns.A{
++		Hdr: dns.RR_Header{Name: "gateway.discord.net.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
++		A:   destination,
++	}}
++	tracker.Learn(answer)
++	picked = ""
++	_, err = router.DialContext(context.Background(), flow)
++	require.NoError(t, err)
++	assert.Equal(t, "socks", picked)
++}
++
+ func TestRouterUnknownOutbound(t *testing.T) {
+ 	var picked string
+ 	proxies := map[string]Proxy{
+@@ -158,7 +211,7 @@ func TestRouterUnknownOutbound(t *testing.T) {
+ 
+ 	router := NewRouter([]cfg.Rule{
+ 		mustRule(t, cfg.Rule{DstPort: "443", OutboundTag: "missing"}),
+-	}, proxies)
++	}, proxies, nil)
+ 
+ 	_, err := router.DialContext(context.Background(), metadata("172.26.0.5", 40000, "1.1.1.1", 443))
+ 	require.Error(t, err)

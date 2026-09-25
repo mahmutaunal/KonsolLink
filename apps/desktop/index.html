@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <title>KonsolLink</title>
+  <style>
+    :root {
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+      color:#f7f9ff; color-scheme:dark; font-synthesis:none;
+      --panel:rgba(20,24,34,.88); --line:rgba(255,255,255,.09); --muted:#99a4b8;
+      --accent:#7c6cff; --accent2:#35c7f3; --good:#48d597;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; overflow-x:hidden; background:#090b11; color:#f7f9ff; }
+    body::before { content:""; position:fixed; inset:-30%; pointer-events:none; background:
+      radial-gradient(circle at 25% 20%, rgba(89,75,255,.28), transparent 28%),
+      radial-gradient(circle at 78% 78%, rgba(30,175,224,.18), transparent 25%); filter:blur(12px); }
+    main { position:relative; width:min(620px, calc(100vw - 36px)); margin:26px auto 34px; }
+    .brand { display:flex; align-items:center; gap:12px; margin:0 4px 22px; }
+    .logo { width:42px; height:42px; border-radius:13px; display:grid; place-items:center; font-weight:900;
+      background:linear-gradient(140deg,var(--accent),var(--accent2)); box-shadow:0 10px 30px rgba(82,94,255,.35); }
+    .brand strong { display:block; font-size:18px; letter-spacing:-.2px; }
+    .brand span { display:block; color:var(--muted); font-size:12px; margin-top:2px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:28px; padding:28px;
+      box-shadow:0 30px 90px rgba(0,0,0,.45); backdrop-filter:blur(24px); }
+    .eyebrow { color:#aaa1ff; font-size:12px; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
+    h1 { margin:9px 0 8px; font-size:36px; line-height:1.05; letter-spacing:-1.3px; }
+    .lead { margin:0; color:#adb6c7; line-height:1.55; font-size:15px; }
+    .health { margin:24px 0 16px; border:1px solid var(--line); border-radius:18px; overflow:hidden; background:rgba(8,10,16,.42); }
+    .health-row { display:flex; align-items:center; justify-content:space-between; min-height:54px; padding:0 17px; }
+    .health-row + .health-row { border-top:1px solid var(--line); }
+    .health-row span:first-child { color:#c8cfdb; font-size:14px; }
+    .value { display:flex; align-items:center; gap:8px; font-size:13px; font-weight:750; color:#aeb7c7; }
+    .dot { width:8px; height:8px; border-radius:50%; background:#687184; box-shadow:0 0 0 4px rgba(104,113,132,.12); }
+    .value.good { color:#7ee9b5; } .value.good .dot { background:var(--good); box-shadow:0 0 0 4px rgba(72,213,151,.12); }
+    .value.wait { color:#c7bcff; } .value.wait .dot { background:#8b7dff; animation:pulse 1.5s infinite; }
+    @keyframes pulse { 50% { box-shadow:0 0 0 7px rgba(139,125,255,0); } }
+    .setup { margin:18px 0; padding:18px; border:1px solid rgba(124,108,255,.22); border-radius:18px;
+      background:linear-gradient(145deg,rgba(124,108,255,.08),rgba(53,199,243,.035)); }
+    .setup h2 { margin:0 0 5px; font-size:16px; letter-spacing:-.2px; }
+    .setup p { margin:0; color:var(--muted); font-size:13px; line-height:1.45; }
+    .settings { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:15px; }
+    .setting { padding:11px 12px; border-radius:12px; background:rgba(4,6,10,.45); border:1px solid var(--line); }
+    .setting small { display:block; color:#7f899c; font-size:10px; text-transform:uppercase; letter-spacing:.08em; margin-bottom:4px; }
+    .setting strong { font-size:13px; font-variant-numeric:tabular-nums; }
+    .guide-grid { display:grid; grid-template-columns:1fr 1fr; gap:9px; margin-top:14px; }
+    .guide { padding:14px; border:1px solid var(--line); border-radius:14px; background:rgba(4,6,10,.32); }
+    .guide h3 { margin:0 0 8px; font-size:13px; }
+    .guide ol { margin:0; padding-left:18px; color:#aeb7c7; font-size:11px; line-height:1.5; }
+    .guide li + li { margin-top:5px; }
+    .shutdown { margin-top:12px; padding:14px; border:1px solid rgba(255,183,77,.2); border-radius:14px;
+      background:rgba(255,162,41,.055); }
+    .shutdown h3 { margin:0 0 6px; color:#ffd08a; font-size:13px; }
+    .shutdown p { margin:0; color:#b9c2d1; font-size:11px; line-height:1.5; }
+    .ready { display:flex; gap:11px; align-items:flex-start; padding:4px 2px; color:#b9c2d1; font-size:13px; line-height:1.45; cursor:pointer; }
+    .ready input { width:17px; height:17px; margin:1px 0 0; accent-color:var(--accent); flex:none; }
+    #toggle { width:100%; border:0; border-radius:15px; padding:15px 18px; margin-top:17px; color:white;
+      font-size:15px; font-weight:820; cursor:pointer; background:linear-gradient(105deg,#6f5df7,#398fef);
+      box-shadow:0 12px 32px rgba(87,78,239,.28); transition:transform .15s ease,opacity .15s ease; }
+    #toggle:hover:not(:disabled) { transform:translateY(-1px); }
+    #toggle:disabled { cursor:not-allowed; opacity:.45; box-shadow:none; }
+    #toggle.stop { background:#2a303d; box-shadow:none; }
+    .banner { margin-top:14px; padding:13px 14px; border-radius:12px; font-size:12px; line-height:1.5; color:#abb5c6;
+      border:1px solid var(--line); background:rgba(5,7,11,.38); }
+    .banner.error { color:#ffc0c8; border-color:rgba(255,113,133,.28); background:rgba(255,70,95,.07); }
+    .privacy { display:flex; gap:8px; align-items:center; justify-content:center; margin:18px 0 0; color:#707a8c; font-size:11px; }
+    .privacy svg { width:13px; opacity:.8; }
+    .hidden { display:none !important; }
+    @media (max-width:520px) { main { width:min(100% - 24px,620px); margin-top:16px; } .card{padding:21px;border-radius:23px} h1{font-size:31px} .guide-grid{grid-template-columns:1fr} }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="brand">
+      <div class="logo" aria-hidden="true">K</div>
+      <div><strong>KonsolLink</strong><span>Yerel Discord bağlantısı</span></div>
+    </header>
+    <section class="card">
+      <div class="eyebrow">Sürüm 1.0</div>
+      <h1>Discord konsolunda.</h1>
+      <p class="lead">Oyunların ve indirmelerin normal internet yolunda kalırken yalnızca Discord bağlantısına yardımcı olur.</p>
+      <div class="health" aria-label="Bağlantı durumu">
+        <div class="health-row"><span>KonsolLink hizmeti</span><span id="gateway" class="value wait"><i class="dot"></i>Bağlanıyor</span></div>
+        <div class="health-row"><span>Discord yolu</span><span id="bypass" class="value"><i class="dot"></i>Kapalı</span></div>
+        <div class="health-row"><span>Oyun ve diğer trafik</span><span id="direct" class="value"><i class="dot"></i>Doğrudan</span></div>
+      </div>
+      <section class="setup" id="setup">
+        <h2>Konsol ağ kurulumu</h2>
+        <p>PlayStation ve Xbox aynı sabit ağ değerlerini kullanır. Önce aşağıdaki değerleri gir, sonra konsoluna ait adımları tamamla.</p>
+        <div class="settings">
+          <div class="setting"><small>IP adresi</small><strong>172.24.2.10</strong></div>
+          <div class="setting"><small>Alt ağ maskesi</small><strong>255.255.0.0</strong></div>
+          <div class="setting"><small>Ağ geçidi</small><strong>172.24.2.1</strong></div>
+          <div class="setting"><small>Birincil DNS</small><strong>1.1.1.1</strong></div>
+          <div class="setting"><small>İkincil DNS</small><strong>8.8.8.8</strong></div>
+          <div class="setting"><small>MTU (PlayStation)</small><strong>1486</strong></div>
+        </div>
+        <div class="guide-grid">
+          <article class="guide">
+            <h3>PlayStation kurulumu</h3>
+            <ol>
+              <li>Ayarlar → Ağ → İnternet Bağlantısını Kur bölümünden kablolu bağlantıyı seç.</li>
+              <li>Gelişmiş Ayarlar’da IP Adresi ve DNS’i Manuel yapıp yukarıdaki değerleri gir.</li>
+              <li>MTU’yu Manuel ve 1486; Proxy Sunucusu’nu Kullanma olarak ayarla.</li>
+            </ol>
+          </article>
+          <article class="guide">
+            <h3>Xbox kurulumu</h3>
+            <ol>
+              <li>Ayarlar → Genel → Ağ Ayarları → Gelişmiş Ayarlar bölümünü aç.</li>
+              <li>IP Ayarları’nı Manuel yapıp IP, alt ağ maskesi ve ağ geçidini gir.</li>
+              <li>DNS Ayarları’nı Manuel yapıp birincil ve ikincil DNS’i gir; diğer ayarları değiştirme.</li>
+            </ol>
+          </article>
+        </div>
+        <div class="shutdown">
+          <h3>KonsolLink’i kapattığında</h3>
+          <p>Önce uygulamadaki “KonsolLink’i kapat” düğmesine bas ve durumun Hazır olmasını bekle. Ardından PlayStation’da IP, DNS ve MTU’yu; Xbox’ta IP ve DNS’i tekrar Otomatik yap. Manuel ağ geçidi açık kalırsa KonsolLink kapalıyken konsol internete bağlanamaz.</p>
+        </div>
+      </section>
+      <label class="ready" id="ready-label">
+        <input id="ready" type="checkbox" />
+        <span>Konsol ağ değerlerini girdim. Mac ve konsol aynı yerel ağda; VPN, İnternet Paylaşımı ve başka bir Zapret/GoodbyeDPI hizmeti kapalı.</span>
+      </label>
+      <button id="toggle" type="button" disabled>KonsolLink hazırlanıyor…</button>
+      <div id="status" class="banner" role="status" aria-live="polite">Önce konsol ağ değerlerini gir; ardından KonsolLink’i aç.</div>
+    </section>
+    <div class="privacy">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>
+      Uzak VPN yok · Telemetri yok · Yalnızca yerel bağlantı
+    </div>
+  </main>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

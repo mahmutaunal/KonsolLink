@@ -1,0 +1,31 @@
+[Unit]
+Description=KonsolLink console Discord gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/konsollink/konsollink-runtime
+Restart=no
+TimeoutStopSec=8
+KillMode=control-group
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SETUID CAP_SETGID
+
+[Install]
+WantedBy=multi-user.target

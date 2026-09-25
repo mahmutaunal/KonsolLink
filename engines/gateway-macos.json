@@ -1,0 +1,43 @@
+{
+  "pcap": {
+    "network": "172.24.0.0/16",
+    "localIP": "172.24.2.1",
+    "mtu": 1486
+  },
+  "dns": {
+    "servers": [
+      { "address": "local" }
+    ]
+  },
+  "routing": {
+    "rules": [
+      { "network": "udp", "dstPort": "53", "outboundTag": "dns-out" },
+      {
+        "network": "tcp",
+        "dstPort": "80,443",
+        "dstDomain": [
+          "discord.com",
+          "discord.gg",
+          "discordapp.com",
+          "discordapp.net",
+          "discord.net",
+          "discord.media",
+          "discordcdn.com",
+          "gateway.discord.gg",
+          "cdn.discordapp.com",
+          "media.discordapp.net",
+          "images-ext-1.discordapp.net",
+          "dl.discordapp.net",
+          "stable.dl2.discordapp.net",
+          "updates.discord.com"
+        ],
+        "outboundTag": ""
+      }
+    ]
+  },
+  "outbounds": [
+    { "tag": "", "direct": {} },
+    { "tag": "dns-out", "dns": {} }
+  ],
+  "capture": { "enabled": false }
+}

@@ -1,0 +1,22 @@
+id = "discord"
+display_name = "Discord"
+market = "TR"
+
+domains = [
+  "discord.com",
+  "discord.gg",
+  "discordapp.com",
+  "discordapp.net",
+  "discord.net",
+  "discord.media",
+  "discordcdn.com"
+]
+
+tcp_ports = [443]
+
+# Runtime DNS/connection tracking must narrow UDP interception to addresses
+# learned from Discord sessions. Port ranges alone MUST NOT be used globally.
+udp_ranges = [
+  [19294, 19344],
+  [50000, 65535]
+]

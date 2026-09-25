@@ -1,0 +1,41 @@
+[component]
+name = "zapret tpws"
+upstream = "https://github.com/bol-van/zapret"
+release = "v72.13"
+commit = "87e058624c72863db53bdaf7fb6f16576dddb6ab"
+license = "MIT"
+bundled = false
+qualification = "source-build-only"
+
+[source]
+archive_url = "https://github.com/bol-van/zapret/releases/download/v72.13/zapret-v72.13.tar.gz"
+archive_sha256 = "25c74e6c5f48963fa244c2955e76694a07c39447245a0457e2efdc74b3317e68"
+license_path = "docs/LICENSE.txt"
+license_sha256 = "dcf5abd3e5d876c1065982871c0cec7368c0e61fc795c541798729516bb6b54f"
+
+[qualified_build]
+host_arch = "arm64"
+macos = "27.0 (26A428)"
+clang = "Apple clang 21.0.0 (clang-2100.3.34.2)"
+sdk = "27.0"
+make = "GNU Make 3.81"
+source_date_epoch = 1784614671
+command = "make -C tpws mac CC=clang"
+output_arches = ["x86_64", "arm64"]
+output_sha256 = "f2749747f9fee28d92bbf149211b21492308c0c9bc6c818a829adc08dd722225"
+dynamic_libraries = ["/usr/lib/libz.1.dylib", "/usr/lib/libSystem.B.dylib"]
+signature = "arm64 linker ad-hoc; x86_64 unsigned; distribution signing required"
+
+[verified_behavior]
+version = true
+valid_dry_run = true
+invalid_dry_run_rejected = true
+two_builds_byte_identical = true
+transparent_mode_live_tested = false
+helper_integrated = true
+macos_process_adapter_compiled = true
+
+[scope]
+transport = "tcp-only"
+udp_media = "direct"
+distribution = "not-approved"

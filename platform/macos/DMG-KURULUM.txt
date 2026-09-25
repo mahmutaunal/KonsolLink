@@ -1,0 +1,9 @@
+KonsolLink 1.0 — İmzasız test sürümü
+
+1. KonsolLink-1.0.0-rc3-unsigned-macos-arm64.pkg dosyasına sağ tıklayın.
+2. “Aç” seçeneğini seçin ve macOS kurulumunu tamamlayın.
+3. Kurulumdan sonra Uygulamalar klasöründeki KonsolLink’i açın.
+
+Bu sürüm imzalanmadığı için macOS ilk açılışta onay isteyebilir. Paket,
+KonsolLink uygulamasıyla birlikte gerekli yerel yardımcı hizmeti ve sabitlenmiş
+ağ motorlarını kurar. Kaldırma betiği DMG içindedir.

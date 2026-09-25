@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+readonly LABEL=tr.konsollink.m0
+readonly ROOT=/Library/PrivilegedHelperTools/tr.konsollink.m0
+readonly HELPER="$ROOT/konsollink-helper"
+readonly PLIST=/Library/LaunchDaemons/tr.konsollink.m0.plist
+
+console_user=$(stat -f %Su /dev/console)
+if [[ -z "$console_user" || "$console_user" == root || "$console_user" == loginwindow ]]; then
+  echo 'No signed-in desktop user; helper activation deferred.' >&2
+  exit 1
+fi
+client_uid=$(id -u "$console_user")
+[[ "$client_uid" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid desktop user UID.' >&2; exit 1; }
+
+chown -R root:wheel "$ROOT"
+chmod 0755 "$ROOT" "$ROOT/engines" "$HELPER"
+chmod 0555 "$ROOT/engines/tpws-v72.13" "$ROOT/engines/go-pcap2socks-ec407738-konsollink"
+chmod 0444 "$ROOT/engines/gateway-macos.json"
+
+umask 077
+cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$LABEL</string>
+<key>ProgramArguments</key><array><string>$HELPER</string><string>serve</string><string>--uid</string><string>$client_uid</string></array>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><true/>
+<key>ThrottleInterval</key><integer>5</integer>
+<key>ExitTimeOut</key><integer>60</integer>
+<key>ProcessType</key><string>Interactive</string>
+<key>Umask</key><integer>63</integer>
+</dict></plist>
+PLIST
+chown root:wheel "$PLIST"
+chmod 0644 "$PLIST"
+plutil -lint "$PLIST"
+launchctl bootstrap system "$PLIST"
+exit 0

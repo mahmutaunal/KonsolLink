@@ -1,0 +1,257 @@
+name: Release 1.0
+
+on:
+  push:
+    tags: ['v1.0.0']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require the complete physical support matrix
+        run: python3 scripts/verify_release_qualification.py release/qualification.json
+
+  metadata-and-audit:
+    needs: qualification
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm --prefix apps/desktop ci
+      - name: Install verified cargo-audit 0.22.2
+        run: |
+          curl -fL --retry 3 -o /tmp/cargo-audit.tgz https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz
+          echo 'ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39  /tmp/cargo-audit.tgz' | sha256sum -c -
+          tar -xzf /tmp/cargo-audit.tgz -C /tmp
+          install -m 0555 /tmp/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit "$HOME/.cargo/bin/cargo-audit"
+      - run: scripts/security_audit.sh
+      - run: SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD) python3 scripts/generate_release_metadata.py
+      - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-metadata
+          path: target/release-metadata
+
+  macos:
+    needs: metadata-and-audit
+    runs-on: macos-15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-metadata
+          path: target/release-metadata
+      - name: Build pinned native engines
+        run: |
+          scripts/build_tpws_macos.sh
+          mkdir -p target/release-sources
+          git clone https://github.com/DaniilSokolyuk/go-pcap2socks target/release-sources/go-pcap2socks
+          git -C target/release-sources/go-pcap2socks checkout ec40773869e835bd09cb134e638e4e3333d89e0c
+          git -C target/release-sources/go-pcap2socks apply "$GITHUB_WORKSPACE/engines/go-pcap2socks-ec407738-konsollink.patch"
+          (cd target/release-sources/go-pcap2socks && go test ./... && CGO_ENABLED=1 go build -trimpath -o "$GITHUB_WORKSPACE/target/m2/go-pcap2socks-ec407738-konsollink" .)
+      - name: Import Apple signing certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          test -n "$APPLE_CERTIFICATE_P12" -a -n "$APPLE_CERTIFICATE_PASSWORD" -a -n "$KEYCHAIN_PASSWORD"
+          python3 -c 'import base64,os; open("/tmp/konsollink.p12","wb").write(base64.b64decode(os.environ["APPLE_CERTIFICATE_P12"], validate=True))'
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security import /tmp/konsollink.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm -f /tmp/konsollink.p12
+      - name: Configure Apple notarization
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          test -n "$APPLE_ID" -a -n "$APPLE_TEAM_ID" -a -n "$APPLE_APP_PASSWORD"
+          xcrun notarytool store-credentials KonsolLinkRelease --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+      - name: Build, sign and notarize macOS package
+        env:
+          APPLE_APPLICATION_IDENTITY: ${{ secrets.APPLE_APPLICATION_IDENTITY }}
+          APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+          APPLE_NOTARY_PROFILE: KonsolLinkRelease
+          GATEWAY_SOURCE: ${{ github.workspace }}/target/release-sources/go-pcap2socks
+        run: scripts/build_macos_release.sh
+      - uses: actions/attest@v4
+        with:
+          subject-path: target/release-packages/macos/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: target/release-packages/macos
+
+  windows:
+    needs: metadata-and-audit
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-metadata
+          path: target/release-metadata
+      - name: Build pinned Windows gateway
+        shell: bash
+        run: |
+          mkdir -p target/m4
+          git clone https://github.com/DaniilSokolyuk/go-pcap2socks target/m4/go-pcap2socks
+          git -C target/m4/go-pcap2socks checkout ec40773869e835bd09cb134e638e4e3333d89e0c
+          git -C target/m4/go-pcap2socks apply "$GITHUB_WORKSPACE/engines/go-pcap2socks-ec407738-konsollink.patch"
+          (cd target/m4/go-pcap2socks && go test ./... && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o ../windows/go-pcap2socks.exe .)
+      - name: Import Authenticode certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ($env:WINDOWS_CERTIFICATE_PFX -eq '' -or $env:WINDOWS_CERTIFICATE_PASSWORD -eq '') { throw 'Windows signing secrets are required.' }
+          $pfx = Join-Path $env:RUNNER_TEMP 'konsollink.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if ($null -eq $certificate -or -not $certificate.HasPrivateKey) { throw 'Certificate import failed.' }
+          "WINDOWS_CERTIFICATE_SHA1=$($certificate.Thumbprint)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $signTool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe | Where-Object FullName -Match '\\x64\\' | Sort-Object FullName -Descending | Select-Object -First 1
+          if ($null -eq $signTool) { throw 'signtool.exe not found.' }
+          "SIGNTOOL_PATH=$($signTool.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Remove-Item $pfx -Force
+      - name: Build signed Windows release
+        shell: pwsh
+        run: ./scripts/build_windows_release.ps1
+      - uses: actions/attest@v4
+        with:
+          subject-path: target/release-packages/windows/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: target/release-packages/windows
+
+  linux:
+    needs: metadata-and-audit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-metadata
+          path: target/release-metadata
+      - run: sudo apt-get update && sudo apt-get install -y libpcap-dev libwebkit2gtk-4.1-dev build-essential libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Build pinned Linux engines
+        run: |
+          mkdir -p target/m4
+          git clone https://github.com/DaniilSokolyuk/go-pcap2socks target/m4/go-pcap2socks
+          git -C target/m4/go-pcap2socks checkout ec40773869e835bd09cb134e638e4e3333d89e0c
+          git -C target/m4/go-pcap2socks apply "$GITHUB_WORKSPACE/engines/go-pcap2socks-ec407738-konsollink.patch"
+          (cd target/m4/go-pcap2socks && go test ./... && CGO_ENABLED=1 go build -trimpath -o ../linux/$(uname -m)/go-pcap2socks .)
+          curl -fL --retry 3 -o target/m4/zapret.tar.gz https://github.com/bol-van/zapret/releases/download/v72.13/zapret-v72.13.tar.gz
+          echo '25c74e6c5f48963fa244c2955e76694a07c39447245a0457e2efdc74b3317e68  target/m4/zapret.tar.gz' | sha256sum -c -
+          mkdir target/m4/zapret
+          tar -xzf target/m4/zapret.tar.gz -C target/m4/zapret --strip-components=1
+          make -C target/m4/zapret/tpws
+          install -D -m 0555 target/m4/zapret/tpws/tpws target/m4/linux/$(uname -m)/tpws
+      - name: Build Linux release
+        run: scripts/build_linux_release.sh
+      - uses: actions/attest@v4
+        with:
+          subject-path: target/release-packages/linux/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: target/release-packages/linux
+
+  publish:
+    needs: [macos, windows, linux]
+    if: startsWith(github.ref, 'refs/tags/v1.0.0')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: assets
+      - name: Consolidate immutable release assets
+        run: |
+          mkdir dist
+          for platform in macos windows linux; do
+            for file in assets/release-$platform/*; do
+              name=$(basename "$file")
+              case "$name" in
+                SHA256SUMS) cp "$file" "dist/$platform-SHA256SUMS.txt" ;;
+                release-manifest.json) cp "$file" "dist/$platform-release-manifest.json" ;;
+                konsollink-1.0.0.cdx.json|LICENSES.md|THIRD_PARTY_NOTICES.md)
+                  if test -e "dist/$name"; then cmp "$file" "dist/$name"; else cp "$file" "dist/$name"; fi ;;
+                *) test ! -e "dist/$name" && cp "$file" "dist/$name" || { echo "Duplicate asset: $name"; exit 1; } ;;
+              esac
+            done
+          done
+          rm -f dist/release-manifest.json dist/SHA256SUMS
+          python3 scripts/make_release_checksums.py create dist
+          python3 scripts/make_release_checksums.py verify dist
+      - uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$GITHUB_REF" = refs/tags/v1.0.0
+          gh release create v1.0.0 dist/* --verify-tag --title 'KonsolLink 1.0.0' --notes-file CHANGELOG.md

@@ -1,0 +1,33 @@
+[network]
+console = "172.24.2.10"
+gateway = "172.24.2.1"
+prefix = 16
+console_mtu = 1486
+
+[go_pcap2socks]
+repository = "https://github.com/DaniilSokolyuk/go-pcap2socks"
+commit = "ec40773869e835bd09cb134e638e4e3333d89e0c"
+license = "GPL-3.0"
+patch = "engines/go-pcap2socks-ec407738-konsollink.patch"
+windows_dependency = "Npcap (protected System32/Npcap installation)"
+
+[windows.goodbyedpi]
+release = "0.2.2"
+archive_url = "https://github.com/ValdikSS/GoodbyeDPI/releases/download/0.2.2/goodbyedpi-0.2.2.zip"
+archive_sha256 = "00a2f8b99cd817f8c7fc4c449033015f039d18af213de78cb66bf202277c0628"
+exe_sha256 = "331ac6c1d22ba5a0a217f3f27d0d823051869cafc8b8ef7f2002fa2accebc74e"
+windivert_dll_sha256 = "a97859785a2df1d4462e7d48d33ccbd89fedd40dac4970f4afd89e63f59ee1ec"
+windivert_driver_sha256 = "53ab28ec00be6e6f8aefa9ee76fc2735e94d7f3f9dbc06eb2b7ac8cd3084a6af"
+strategy = "-5 --blacklist discord-hosts.txt"
+license = "Apache-2.0; bundled WinDivert terms retained"
+
+[windows.windivert_reference]
+release = "2.2.2-A"
+archive_url = "https://reqrypt.org/download/WinDivert-2.2.2-A.zip"
+archive_sha256 = "63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15"
+note = "Reference hash only; GoodbyeDPI 0.2.2 is packaged with its matching signed driver."
+
+[linux]
+dpi_engine = "zapret tpws v72.13"
+service_manager = "systemd"
+authorization = "polkit local active admin"

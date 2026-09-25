@@ -1,0 +1,30 @@
+#!/bin/bash
+set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+readonly LABEL=tr.konsollink.m0
+readonly ROOT=/Library/PrivilegedHelperTools/tr.konsollink.m0
+readonly HELPER="$ROOT/konsollink-helper"
+readonly JOURNAL=/private/var/db/konsollink/journal.json
+
+if [[ -e "$ROOT" || -L "$ROOT" ]]; then
+  [[ -d "$ROOT" && ! -L "$ROOT" && -f "$HELPER" && ! -L "$HELPER" ]] || {
+    echo 'Existing KonsolLink helper path is unsafe; installation stopped.' >&2
+    exit 1
+  }
+  [[ $(stat -f %u "$HELPER") == 0 ]] || { echo 'Existing helper is not root-owned.' >&2; exit 1; }
+  "$HELPER" stop >/dev/null 2>&1 || true
+  launchctl bootout "system/$LABEL" >/dev/null 2>&1 || true
+
+  # A prior interrupted install can leave the payload directory without ever
+  # creating a network journal. There is nothing to recover in that state and
+  # treating it as an active session makes every subsequent install fail.
+  if [[ -e "$JOURNAL" || -L "$JOURNAL" ]]; then
+    for _ in 1 2 3 4 5; do
+      if "$HELPER" recover; then exit 0; fi
+      sleep 1
+    done
+    echo 'Existing network session could not be recovered; files were retained.' >&2
+    exit 1
+  fi
+fi
+exit 0

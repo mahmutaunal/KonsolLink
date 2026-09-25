@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Rust + desktop (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      # Hosted runners have rustup; this installs rust-toolchain.toml exactly,
+      # including rustfmt/clippy, instead of following the moving stable channel.
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install locked frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+      - name: Build frontend
+        working-directory: apps/desktop
+        run: npm run build
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+      - name: Lint all Rust targets
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace and helper CLI
+        run: cargo test --workspace --locked
+      - name: Test audited macOS PF source patches (no root or networking)
+        if: runner.os == 'macOS'
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/pfctl-tests
+        run: cargo test --manifest-path vendor/pfctl/Cargo.toml --locked --lib
+      - name: Build desktop with embedded frontend
+        working-directory: apps/desktop
+        run: npm run tauri build -- --debug --no-bundle --ci -- --locked
+      - name: Check source policy after build
+        run: |
+          python scripts/verify_source.py
+          python scripts/verify_release_source.py
+          python scripts/verify_gateway_policy.py
+          python -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+  source-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python3 scripts/verify_source.py
+          python3 scripts/verify_release_source.py
+          python3 scripts/verify_gateway_policy.py
+
+  windows-runtime:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+          cache-dependency-path: platform/windows/service/go.sum
+      - name: Test and build the SCM supervisor
+        working-directory: platform/windows/service
+        run: |
+          go test ./...
+          go build -trimpath -o ../../../target/m4/windows/KonsolLinkService.exe .
+      - name: Build the pinned userspace gateway
+        shell: bash
+        run: |
+          git clone https://github.com/DaniilSokolyuk/go-pcap2socks target/m4/go-pcap2socks
+          git -C target/m4/go-pcap2socks checkout ec40773869e835bd09cb134e638e4e3333d89e0c
+          git -C target/m4/go-pcap2socks apply "$GITHUB_WORKSPACE/engines/go-pcap2socks-ec407738-konsollink.patch"
+          cd target/m4/go-pcap2socks
+          go test ./...
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o ../windows/go-pcap2socks.exe .
+      - name: Assemble the hash-locked Windows package
+        shell: pwsh
+        run: ./scripts/build_windows_package.ps1 -GatewayBinary ./target/m4/windows/go-pcap2socks.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KonsolLink-M4-windows-x64
+          path: target/m4/KonsolLink-0.4.0-windows-x64.zip
+
+  linux-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+      - name: Install capture build dependency
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+      - name: Verify scripts and closed runtime policy
+        run: |
+          bash -n platform/linux/konsollink-runtime.sh platform/linux/install.sh scripts/build_linux_package.sh
+          bash scripts/test_linux_runtime.sh
+          python3 scripts/verify_gateway_policy.py
+      - name: Build the pinned userspace gateway
+        run: |
+          git clone https://github.com/DaniilSokolyuk/go-pcap2socks target/m4/go-pcap2socks
+          git -C target/m4/go-pcap2socks checkout ec40773869e835bd09cb134e638e4e3333d89e0c
+          git -C target/m4/go-pcap2socks apply "$GITHUB_WORKSPACE/engines/go-pcap2socks-ec407738-konsollink.patch"
+          cd target/m4/go-pcap2socks
+          go test ./...
+          CGO_ENABLED=1 go build -trimpath -o ../linux/$(uname -m)/go-pcap2socks .
+      - name: Build pinned tpws and assemble package
+        run: |
+          curl -fL --retry 3 -o target/m4/zapret.tar.gz https://github.com/bol-van/zapret/releases/download/v72.13/zapret-v72.13.tar.gz
+          echo '25c74e6c5f48963fa244c2955e76694a07c39447245a0457e2efdc74b3317e68  target/m4/zapret.tar.gz' | sha256sum -c -
+          mkdir -p target/m4/zapret
+          tar -xzf target/m4/zapret.tar.gz -C target/m4/zapret --strip-components=1
+          make -C target/m4/zapret/tpws
+          install -D -m 0555 target/m4/zapret/tpws/tpws target/m4/linux/$(uname -m)/tpws
+          scripts/build_linux_package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KonsolLink-M4-linux-x64
+          path: target/m4/KonsolLink-0.4.0-linux-*.tar.gz

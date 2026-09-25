@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+exclude = ["vendor/pfctl"]
+members = [
+  "crates/konsollink-core",
+  "crates/konsollink-platform",
+  "helper",
+  "apps/desktop/src-tauri",
+]
+default-members = [
+  "crates/konsollink-core",
+  "crates/konsollink-platform",
+  "helper",
+]
+
+[patch.crates-io]
+pfctl = { path = "vendor/pfctl" }

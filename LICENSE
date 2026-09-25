@@ -1,0 +1,26 @@
+KonsolLink
+Copyright (C) 2026 KonsolLink contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, version 3 of the License only.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+SPDX-License-Identifier: GPL-3.0-only
+
+The complete, unmodified GNU General Public License version 3 text is included
+in this repository at:
+
+    engines/go-pcap2socks-LICENSE
+
+An official copy is also available at:
+
+    https://www.gnu.org/licenses/gpl-3.0.txt
+
+This license applies only to original KonsolLink material unless a file states
+otherwise. Third-party components, bundled or referenced by this repository,
+remain under their respective licenses. See THIRD_PARTY_NOTICES.md and the
+license files shipped with those components.
