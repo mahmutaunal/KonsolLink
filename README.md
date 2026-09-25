@@ -1,11 +1,17 @@
 # KonsolLink
 
+![macOS](https://img.shields.io/badge/macOS-Verified-2DD4A8) ![Windows](https://img.shields.io/badge/Windows-In%20Development-555B66) ![Linux](https://img.shields.io/badge/Linux-In%20Development-555B66) ![License](https://img.shields.io/badge/License-GPL--3.0--only-2DD4A8)
+
 **Türkiye’deki konsol kullanıcıları için yerel Discord bağlantısı.**
 
 KonsolLink, PlayStation ve Xbox’ın yerleşik Discord özelliğine ait bağlantıları
 aynı yerel ağdaki Mac üzerinden geçirir. Oyun, mağaza, indirme ve diğer konsol
 trafiği normal internet yolunda kalır. Uzak VPN, üyelik hesabı veya KonsolLink
 sunucusu kullanılmaz.
+
+<p align="center">
+  <img src="./assets/banner.png" alt="KonsolLink — Console Discord routing for Windows, macOS and Linux" width="100%" />
+</p>
 
 > [!IMPORTANT]
 > Şu anda yayıma hazır ve fiziksel olarak doğrulanmış sürüm yalnızca **Apple
