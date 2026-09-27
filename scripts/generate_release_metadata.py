@@ -29,8 +29,14 @@ def cargo_metadata() -> dict:
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
-    return json.loads(result.stdout)
+    if not result.stdout:
+        raise RuntimeError("cargo metadata returned no JSON output")
+    metadata = json.loads(result.stdout)
+    if not isinstance(metadata, dict):
+        raise ValueError("cargo metadata returned a non-object JSON document")
+    return metadata
 
 
 def license_objects(expression: str | None) -> list[dict]:
