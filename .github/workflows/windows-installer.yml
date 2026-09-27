@@ -21,6 +21,10 @@ jobs:
         with:
           go-version-file: platform/windows/service/go.mod
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Verify pinned Rust toolchain and required tools
         shell: pwsh
         run: |
@@ -37,6 +41,12 @@ jobs:
         run: |
           npm ci
           if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
+
+      - name: Fetch locked Cargo workspace dependencies
+        shell: pwsh
+        run: |
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Locked Cargo dependency fetch failed.' }
 
       - name: Prepare Windows service Go dependencies
         shell: pwsh
@@ -91,11 +101,18 @@ jobs:
           $expected = '00a2f8b99cd817f8c7fc4c449033015f039d18af213de78cb66bf202277c0628'
           if ($actual -ne $expected) { throw "GoodbyeDPI SHA-256 mismatch: $actual" }
 
-      - name: Fetch locked Cargo workspace dependencies
+      - name: Generate release metadata
         shell: pwsh
         run: |
-          cargo fetch --locked
-          if ($LASTEXITCODE -ne 0) { throw 'Locked Cargo dependency fetch failed.' }
+          python .\scripts\generate_release_metadata.py
+          if ($LASTEXITCODE -ne 0) { throw 'Release metadata generation or license validation failed.' }
+          foreach ($file in @(
+            'target/release-metadata/konsollink-1.0.0.cdx.json',
+            'target/release-metadata/LICENSES.md',
+            'target/release-metadata/licenses.json'
+          )) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Release metadata is missing: $file" }
+          }
 
       - name: Build unsigned Windows RC installer
         shell: pwsh
