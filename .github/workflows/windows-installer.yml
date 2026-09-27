@@ -91,6 +91,12 @@ jobs:
           $expected = '00a2f8b99cd817f8c7fc4c449033015f039d18af213de78cb66bf202277c0628'
           if ($actual -ne $expected) { throw "GoodbyeDPI SHA-256 mismatch: $actual" }
 
+      - name: Fetch locked Cargo workspace dependencies
+        shell: pwsh
+        run: |
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Locked Cargo dependency fetch failed.' }
+
       - name: Build unsigned Windows RC installer
         shell: pwsh
         env:
