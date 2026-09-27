@@ -19,7 +19,6 @@ if ($Unsigned -and $env:ALLOW_UNSIGNED_RC -ne '1') {
 }
 $Suffix = if ($Unsigned) { '-rc-unsigned' } else { '' }
 $Package = Join-Path $OutputRoot "KonsolLink-1.0.0$Suffix-windows-x64"
-$ArchiveUrl = 'https://github.com/ValdikSS/GoodbyeDPI/releases/download/0.2.2/goodbyedpi-0.2.2.zip'
 $ArchiveHash = '00a2f8b99cd817f8c7fc4c449033015f039d18af213de78cb66bf202277c0628'
 
 if (-not (Test-Path -LiteralPath $GatewayBinary -PathType Leaf)) { throw "Missing patched gateway: $GatewayBinary" }
@@ -27,7 +26,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $GatewaySource '.git') -PathType Con
 $GatewayCommit = (git -C $GatewaySource rev-parse HEAD).Trim()
 if ($GatewayCommit -ne 'ec40773869e835bd09cb134e638e4e3333d89e0c') { throw 'Gateway source commit differs from the reviewed pin.' }
 if (-not (Test-Path -LiteralPath $GoodbyeDpiArchive -PathType Leaf)) {
-    Invoke-WebRequest -UseBasicParsing -Uri $ArchiveUrl -OutFile $GoodbyeDpiArchive
+    throw "Missing local GoodbyeDPI archive: $GoodbyeDpiArchive"
 }
 if ((Get-FileHash -Algorithm SHA256 $GoodbyeDpiArchive).Hash.ToLowerInvariant() -ne $ArchiveHash) {
     throw 'GoodbyeDPI archive SHA-256 mismatch.'
@@ -35,12 +34,20 @@ if ((Get-FileHash -Algorithm SHA256 $GoodbyeDpiArchive).Hash.ToLowerInvariant() 
 
 $ServiceDir = Join-Path $Root 'platform\windows\service'
 Push-Location $ServiceDir
+$PreviousGoProxy = $env:GOPROXY
+$PreviousGoSumDb = $env:GOSUMDB
 try {
+    $env:GOPROXY = 'off'; $env:GOSUMDB = 'off'
     $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
     go test ./...
+    if ($LASTEXITCODE -ne 0) { throw 'Windows service tests failed or local Go dependencies are missing.' }
     New-Item -ItemType Directory -Force -Path (Join-Path $Root 'target\m4\windows') | Out-Null
     go build -trimpath -ldflags='-s -w' -o (Join-Path $Root 'target\m4\windows\KonsolLinkService.exe') .
-} finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0) { throw 'Windows service build failed or local Go dependencies are missing.' }
+} finally {
+    $env:GOPROXY = $PreviousGoProxy; $env:GOSUMDB = $PreviousGoSumDb
+    Pop-Location
+}
 
 $Extract = Join-Path $env:TEMP 'konsollink-goodbyedpi-0.2.2'
 if (Test-Path $Extract) { Remove-Item -Recurse -Force $Extract }

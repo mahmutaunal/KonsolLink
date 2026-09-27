@@ -21,11 +21,21 @@ function Invoke-Sc([string[]]$Arguments) {
     if ($process.ExitCode -ne 0) { throw "sc.exe failed ($($process.ExitCode)): $($Arguments -join ' ')" }
 }
 
+function Stop-KonsolLinkService {
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($null -ne $service -and $service.Status -ne 'Stopped') {
+        Stop-Service -Name $ServiceName -ErrorAction Stop
+        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+    }
+    return $null -ne $service
+}
+
 if ($Action -eq 'Uninstall') {
-    & "$env:SystemRoot\System32\sc.exe" stop $ServiceName 2>$null | Out-Null
-    Start-Sleep -Seconds 2
-    & "$env:SystemRoot\System32\sc.exe" delete $ServiceName 2>$null | Out-Null
-    if (Test-Path -LiteralPath $InstallRoot) { Remove-Item -LiteralPath $InstallRoot -Recurse -Force }
+    if (Stop-KonsolLinkService) { Invoke-Sc -Arguments @('delete', $ServiceName) }
+    foreach ($name in $RuntimeFiles) {
+        $path = Join-Path $InstallRoot $name
+        if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+    }
     exit 0
 }
 
@@ -49,7 +59,7 @@ if ($installerManifest.schema -ne 1 -or $installerManifest.service_sha256 -notma
 }
 $serviceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PackageRoot 'KonsolLinkService.exe')).Hash.ToLowerInvariant()
 if ($serviceHash -ne $installerManifest.service_sha256) { throw 'SHA-256 mismatch: KonsolLinkService.exe' }
-$HashedFiles = $RuntimeFiles | Where-Object { $_ -notin @('KonsolLinkService.exe', 'runtime-manifest.json') }
+$HashedFiles = $RuntimeFiles | Where-Object { $_ -notin @('KonsolLinkService.exe', 'runtime-manifest.json', 'installer-manifest.json') }
 foreach ($name in $HashedFiles) {
     $expected = $manifest.files.$name
     if ($expected -notmatch '^[0-9a-f]{64}$') { throw "Missing manifest hash: $name" }
@@ -57,17 +67,53 @@ foreach ($name in $HashedFiles) {
     if ($actual -ne $expected) { throw "SHA-256 mismatch: $name" }
 }
 
-if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-    throw 'KonsolLink service already exists. Uninstall it before replacing the runtime.'
-}
-New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
-foreach ($name in $RuntimeFiles) { Copy-Item -LiteralPath (Join-Path $PackageRoot $name) -Destination $InstallRoot -Force }
+$ExistingService = Stop-KonsolLinkService
+$BackupRoot = Join-Path $env:TEMP ([Guid]::NewGuid().ToString('N'))
+$CreatedService = $false
+New-Item -ItemType Directory -Path $BackupRoot | Out-Null
+try {
+    New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+    foreach ($name in $RuntimeFiles) {
+        $installed = Join-Path $InstallRoot $name
+        if (Test-Path -LiteralPath $installed -PathType Leaf) {
+            Copy-Item -LiteralPath $installed -Destination $BackupRoot -Force
+        }
+    }
+    foreach ($name in $RuntimeFiles) {
+        Copy-Item -LiteralPath (Join-Path $PackageRoot $name) -Destination $InstallRoot -Force
+    }
 
-# Inheritance is removed: only SYSTEM and Administrators can replace runtime files.
-& "$env:SystemRoot\System32\icacls.exe" $InstallRoot '/inheritance:r' '/grant:r' 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' | Out-Null
-$binary = '"' + (Join-Path $InstallRoot 'KonsolLinkService.exe') + '"'
-Invoke-Sc -Arguments @('create', $ServiceName, "binPath= $binary", 'start= demand', 'DisplayName= KonsolLink')
-Invoke-Sc -Arguments @('failure', $ServiceName, 'reset= 86400', 'actions= restart/3000/restart/10000//')
-# Authenticated desktop users may query/start/stop this one service; they cannot reconfigure it.
-Invoke-Sc -Arguments @('sdset', $ServiceName, 'D:(A;;CCLCSWRPWPDTLOCRRC;;;AU)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)')
+    # The desktop executable must remain readable; runtime files stay restricted.
+    foreach ($name in $RuntimeFiles) {
+        & "$env:SystemRoot\System32\icacls.exe" (Join-Path $InstallRoot $name) '/inheritance:r' '/grant:r' 'SYSTEM:F' 'BUILTIN\Administrators:F' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not secure runtime file: $name" }
+    }
+    & "$env:SystemRoot\System32\icacls.exe" $InstallRoot '/inheritance:r' '/grant:r' 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' 'BUILTIN\Users:(OI)(CI)RX' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not secure the KonsolLink installation directory.' }
+    $binary = '"' + (Join-Path $InstallRoot 'KonsolLinkService.exe') + '"'
+    if (-not $ExistingService) {
+        Invoke-Sc -Arguments @('create', $ServiceName, "binPath= $binary", 'start= demand', 'DisplayName= KonsolLink')
+        $CreatedService = $true
+    }
+    Invoke-Sc -Arguments @('failure', $ServiceName, 'reset= 86400', 'actions= restart/3000/restart/10000//')
+    # Authenticated desktop users may query/start/stop this one service; they cannot reconfigure it.
+    Invoke-Sc -Arguments @('sdset', $ServiceName, 'D:(A;;CCLCSWRPWPDTLOCRRC;;;AU)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)')
+    if ($ExistingService) {
+        Invoke-Sc -Arguments @('config', $ServiceName, "binPath= $binary", 'start= demand', 'DisplayName= KonsolLink')
+    }
+} catch {
+    if ($CreatedService) { Invoke-Sc -Arguments @('delete', $ServiceName) }
+    foreach ($name in $RuntimeFiles) {
+        $installed = Join-Path $InstallRoot $name
+        $backup = Join-Path $BackupRoot $name
+        if (Test-Path -LiteralPath $backup -PathType Leaf) {
+            Copy-Item -LiteralPath $backup -Destination $installed -Force
+        } elseif (Test-Path -LiteralPath $installed -PathType Leaf) {
+            Remove-Item -LiteralPath $installed -Force
+        }
+    }
+    throw
+} finally {
+    Remove-Item -LiteralPath $BackupRoot -Recurse -Force
+}
 Write-Host 'KonsolLink Windows service installed. No network setting was changed.'

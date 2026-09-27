@@ -16,25 +16,32 @@ if (($CertificateSha1 -eq '' -or $SignTool -eq '') -and -not $Unsigned) {
     throw 'Authenticode certificate thumbprint and signtool are required for a stable release.'
 }
 $Suffix = if ($Unsigned) { '-rc-unsigned' } else { '' }
+$Package = Join-Path $Root "target\m4\KonsolLink-1.0.0$Suffix-windows-x64"
+$RuntimeZip = "$Package.zip"
+& (Join-Path $Root 'scripts\build_windows_package.ps1') -GatewayBinary $GatewayBinary -GatewaySource $GatewaySource -OutputRoot (Join-Path $Root 'target\m4') -SignTool $(if ($Unsigned) { '' } else { $SignTool }) -CertificateSha1 $(if ($Unsigned) { '' } else { $CertificateSha1 })
+if (-not (Test-Path -LiteralPath (Join-Path $Package 'install.ps1') -PathType Leaf)) { throw 'Prepared Windows runtime is missing.' }
 
 $TauriConfigPath = Join-Path $Root 'apps\desktop\src-tauri\tauri.conf.json'
 $TauriConfigOriginal = Get-Content -LiteralPath $TauriConfigPath -Raw
+$TauriConfig = $TauriConfigOriginal | ConvertFrom-Json
+$TauriConfig.bundle | Add-Member -Force -NotePropertyName resources -NotePropertyValue @{ "$Package\" = 'runtime/' }
 if (-not $Unsigned) {
-    $TauriConfig = $TauriConfigOriginal | ConvertFrom-Json
-    if ($null -eq $TauriConfig.bundle.windows) {
-        $TauriConfig.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{})
-    }
     $TauriConfig.bundle.windows | Add-Member -Force -NotePropertyName certificateThumbprint -NotePropertyValue $CertificateSha1
     $TauriConfig.bundle.windows | Add-Member -Force -NotePropertyName digestAlgorithm -NotePropertyValue 'sha256'
     $TauriConfig.bundle.windows | Add-Member -Force -NotePropertyName timestampUrl -NotePropertyValue 'http://timestamp.digicert.com'
-    $TauriConfig | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $TauriConfigPath -Encoding utf8NoBOM
 }
+$TauriConfig | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $TauriConfigPath -Encoding utf8NoBOM
+$PreviousCargoOffline = $env:CARGO_NET_OFFLINE
 Push-Location (Join-Path $Root 'apps\desktop')
 try {
-    npm ci
+    if (-not (Test-Path -LiteralPath 'node_modules\.bin\tauri.cmd' -PathType Leaf)) { throw 'Local desktop dependencies are missing; prepare them before building.' }
     npm run build
+    if ($LASTEXITCODE -ne 0) { throw 'Desktop frontend build failed.' }
+    $env:CARGO_NET_OFFLINE = 'true'
     npm run tauri -- build --bundles nsis --ci -- --locked
+    if ($LASTEXITCODE -ne 0) { throw 'Tauri NSIS build failed or local Rust dependencies are missing.' }
 } finally {
+    $env:CARGO_NET_OFFLINE = $PreviousCargoOffline
     Pop-Location
     Set-Content -LiteralPath $TauriConfigPath -Value $TauriConfigOriginal -Encoding utf8NoBOM -NoNewline
 }
@@ -49,8 +56,6 @@ if (-not $Unsigned) {
     if ($LASTEXITCODE -ne 0) { throw 'NSIS Authenticode verification failed.' }
 }
 
-& (Join-Path $Root 'scripts\build_windows_package.ps1') -GatewayBinary $GatewayBinary -GatewaySource $GatewaySource -OutputRoot (Join-Path $Root 'target\m4') -SignTool $(if ($Unsigned) { '' } else { $SignTool }) -CertificateSha1 $(if ($Unsigned) { '' } else { $CertificateSha1 })
-$RuntimeZip = Join-Path $Root "target\m4\KonsolLink-1.0.0$Suffix-windows-x64.zip"
 Copy-Item $Nsis.FullName (Join-Path $Out "KonsolLink-1.0.0$Suffix-windows-x64-setup.exe") -Force
 Copy-Item $RuntimeZip $Out -Force
 Copy-Item (Join-Path $Root 'target\release-metadata\konsollink-1.0.0.cdx.json') $Out -Force

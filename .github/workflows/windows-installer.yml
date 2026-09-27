@@ -1,0 +1,109 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: platform/windows/service/go.mod
+
+      - name: Verify pinned Rust toolchain and required tools
+        shell: pwsh
+        run: |
+          rustup show active-toolchain
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust toolchain is unavailable.' }
+          python --version
+          if ($LASTEXITCODE -ne 0) { throw 'Python is unavailable.' }
+          git --version
+          if ($LASTEXITCODE -ne 0) { throw 'Git is unavailable.' }
+
+      - name: Prepare desktop dependencies
+        shell: pwsh
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
+
+      - name: Prepare Windows service Go dependencies
+        shell: pwsh
+        working-directory: platform/windows/service
+        run: |
+          go mod download
+          if ($LASTEXITCODE -ne 0) { throw 'Windows service Go dependencies could not be downloaded.' }
+
+      - name: Build pinned patched gateway
+        shell: pwsh
+        run: |
+          $source = Join-Path $env:GITHUB_WORKSPACE 'target/m4/go-pcap2socks'
+          $binary = Join-Path $env:GITHUB_WORKSPACE 'target/m4/windows/go-pcap2socks.exe'
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'engines/go-pcap2socks-ec407738-konsollink.patch'
+          New-Item -ItemType Directory -Force -Path $source, (Split-Path $binary) | Out-Null
+          git -C $source init
+          if ($LASTEXITCODE -ne 0) { throw 'Gateway checkout initialization failed.' }
+          git -C $source remote add origin https://github.com/DaniilSokolyuk/go-pcap2socks.git
+          if ($LASTEXITCODE -ne 0) { throw 'Gateway remote setup failed.' }
+          git -C $source fetch --depth 1 origin ec40773869e835bd09cb134e638e4e3333d89e0c
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned gateway commit could not be fetched.' }
+          git -C $source checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned gateway checkout failed.' }
+          $head = (git -C $source rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -ne 'ec40773869e835bd09cb134e638e4e3333d89e0c') {
+            throw "Gateway commit mismatch: $head"
+          }
+          git -C $source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Gateway patch does not apply.' }
+          git -C $source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Gateway patch application failed.' }
+          Push-Location $source
+          try {
+            go mod download
+            if ($LASTEXITCODE -ne 0) { throw 'Gateway Go dependencies could not be downloaded.' }
+            $env:GOOS = 'windows'
+            $env:GOARCH = 'amd64'
+            $env:CGO_ENABLED = '0'
+            go build -trimpath -ldflags='-s -w' -o $binary .
+            if ($LASTEXITCODE -ne 0) { throw 'Patched gateway build failed.' }
+          } finally {
+            Pop-Location
+          }
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Patched gateway binary is missing.' }
+
+      - name: Download and verify pinned GoodbyeDPI archive
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:TEMP 'goodbyedpi-0.2.2.zip'
+          Invoke-WebRequest -Uri 'https://github.com/ValdikSS/GoodbyeDPI/releases/download/0.2.2/goodbyedpi-0.2.2.zip' -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          $expected = '00a2f8b99cd817f8c7fc4c449033015f039d18af213de78cb66bf202277c0628'
+          if ($actual -ne $expected) { throw "GoodbyeDPI SHA-256 mismatch: $actual" }
+
+      - name: Build unsigned Windows RC installer
+        shell: pwsh
+        env:
+          ALLOW_UNSIGNED_RC: '1'
+        run: |
+          .\scripts\build_windows_release.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release build failed.' }
+          $installer = 'target/release-packages/windows/KonsolLink-1.0.0-rc-unsigned-windows-x64-setup.exe'
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw "Expected installer is missing: $installer" }
+
+      - name: Upload Windows release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: KonsolLink-Windows-Unsigned-RC
+          path: target/release-packages/windows/
+          if-no-files-found: error
