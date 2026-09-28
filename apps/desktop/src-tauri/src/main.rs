@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -135,12 +137,42 @@ mod gateway {
     }
     #[cfg(target_os = "windows")]
     fn active() -> Result<bool, String> {
-        let output = service("status")?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        Ok(output.status.success()
-            && text
-                .lines()
-                .any(|line| line.contains("STATE") && line.contains("RUNNING")))
+        use windows_sys::Win32::{
+            Foundation::ERROR_SERVICE_DOES_NOT_EXIST,
+            System::Services::{
+                CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
+                SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+            },
+        };
+
+        // Polling happens every three seconds while the GUI is open. Query the
+        // fixed service directly instead of spawning sc.exe for every poll.
+        let manager =
+            unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+        if manager.is_null() {
+            return Err(format!(
+                "Windows hizmet yöneticisi açılamadı: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let name: Vec<u16> = "KonsolLink\0".encode_utf16().collect();
+        let handle = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_STATUS) };
+        let open_error = std::io::Error::last_os_error();
+        unsafe { CloseServiceHandle(manager) };
+        if handle.is_null() {
+            if open_error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) {
+                return Ok(false);
+            }
+            return Err(format!("KonsolLink hizmeti açılamadı: {open_error}"));
+        }
+        let mut state = std::mem::MaybeUninit::<SERVICE_STATUS>::uninit();
+        let queried = unsafe { QueryServiceStatus(handle, state.as_mut_ptr()) };
+        let query_error = std::io::Error::last_os_error();
+        unsafe { CloseServiceHandle(handle) };
+        if queried == 0 {
+            return Err(format!("KonsolLink hizmet durumu okunamadı: {query_error}"));
+        }
+        Ok(unsafe { state.assume_init() }.dwCurrentState == SERVICE_RUNNING)
     }
 
     #[cfg(target_os = "linux")]
