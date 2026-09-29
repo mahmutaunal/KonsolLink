@@ -1,6 +1,6 @@
 # KonsolLink
 
-![macOS](https://img.shields.io/badge/macOS-Verified-2DD4A8) ![Windows](https://img.shields.io/badge/Windows-In%20Development-555B66) ![Linux](https://img.shields.io/badge/Linux-In%20Development-555B66) ![License](https://img.shields.io/badge/License-GPL--3.0--only-2DD4A8)
+![macOS](https://img.shields.io/badge/macOS-Verified-2DD4A8) ![Windows](https://img.shields.io/badge/Windows-Verified-2DD4A8) ![Linux](https://img.shields.io/badge/Linux-In%20Development-555B66) ![License](https://img.shields.io/badge/License-GPL--3.0--only-2DD4A8)
 
 **Türkiye’deki konsol kullanıcıları için yerel Discord bağlantısı.**
 
@@ -14,9 +14,9 @@ sunucusu kullanılmaz.
 </p>
 
 > [!IMPORTANT]
-> Şu anda yayıma hazır ve fiziksel olarak doğrulanmış sürüm yalnızca **Apple
-> Silicon macOS + Türk Telekom + PlayStation 5 ve Xbox Series X/S** yapılandırmasıdır. Windows ve
-> Linux uygulamaları henüz kullanıma hazır değildir.
+> Şu anda yayıma hazır ve fiziksel olarak doğrulanmış sürümler **Apple Silicon macOS** ve **Windows x64** sürümleridir.
+> KonsolLink, Türk Telekom bağlantısında PlayStation 5 ve Xbox Series X/S ile fiziksel olarak test edilmiştir.
+> Lünux uygulaması henüz kullanıma hazır değildir.
 
 ## Uygulama görünümü
 
@@ -30,7 +30,7 @@ sunucusu kullanılmaz.
 | Platform | Durum | Açıklama |
 |---|---|---|
 | macOS / Apple Silicon | Kullanılabilir | Türk Telekom ve PlayStation 5, Xbox Series X/S üzerinde fiziksel olarak çalıştığı doğrulandı. |
-| Windows x64 | Hazır değil | Kod ve paketleme altyapısı mevcut; gerçek Windows/konsol kabul testi tamamlanmadı. |
+| Windows x64 | Kullanılabilir | Türk Telekom ve PlayStation 5, Xbox Series X/S üzerinde fiziksel olarak çalıştığı doğrulandı. |
 | Linux x64 | Hazır değil | Kod ve servis altyapısı mevcut; gerçek Linux/konsol kabul testi tamamlanmadı. |
 
 Bu tablo yeni fiziksel testler tamamlandıkça güncellenecektir. “Hazır değil”
@@ -39,6 +39,8 @@ garanti verilmesi amaçlanmaz.
 
 ## Gereksinimler
 
+### macOS
+
 - Apple Silicon işlemcili bir Mac
 - Türk Telekom internet bağlantısı
 - Aynı modem/yerel ağa bağlı Mac ve PlayStation 5 veya Xbox Series X/S
@@ -46,12 +48,22 @@ garanti verilmesi amaçlanmaz.
 - Konsolun modeme Ethernet veya aynı yerel ağ üzerinden bağlantısı
 - Mac’te VPN, İnternet Paylaşımı ve başka Zapret/GoodbyeDPI hizmetlerinin kapalı olması
 
-Konsol ile Mac’in birbirine doğrudan Ethernet kablosuyla bağlanması gerekmez.
+### Windows
+
+- x64 tabanlı Windows bilgisayar
+- Npcap (WinPcap API-compatible Mode etkin)
+- Türk Telekom internet bağlantısı
+- Aynı modem/yerel ağa bağlı Windows bilgisayar ve PlayStation 5 veya Xbox Series X/S
+- Bilgisayarın çalışan internet bağlantısı
+- Konsolun modeme Ethernet veya aynı yerel ağ üzerinden bağlantısı
+- VPN, İnternet Paylaşımı ve başka DPI araçlarının kapalı olması
+
+Konsol ile bilgisayarın birbirine doğrudan Ethernet kablosuyla bağlanması gerekmez.
 İkisinin aynı yerel ağda bulunması yeterlidir.
 
-## Kurulum ve kullanım
+### 1. Uygulamayı kur
 
-### 1. Mac uygulamasını kur
+#### macOS
 
 1. Yayımlanan macOS DMG dosyasını aç.
 2. İçindeki kurulum paketine sağ tıklayıp **Aç** seçeneğini kullan.
@@ -60,6 +72,20 @@ Konsol ile Mac’in birbirine doğrudan Ethernet kablosuyla bağlanması gerekme
 
 İmzasız geliştirme paketlerinde macOS ek güvenlik uyarısı gösterebilir. Yalnızca
 bu deponun Releases bölümünden veya kendiniz derlediğiniz paketi kullanın.
+
+#### Windows
+
+1. [Npcap](https://npcap.com/) kurulu değilse resmi kaynaktan indirip kur.
+2. Npcap kurulumunda **WinPcap API-compatible Mode** seçeneğinin etkin olduğundan emin ol.
+3. KonsolLink’in Windows x64 kurulum dosyasını Releases bölümünden indir.
+4. Kurulum dosyasını çalıştır ve kurulumu tamamla.
+5. Başlat menüsünden **KonsolLink**’i aç.
+
+> [!NOTE]
+> Windows sürümü şu anda dijital olarak imzalanmamıştır. Bu nedenle Windows
+> SmartScreen kurulum sırasında **Unknown publisher** veya benzeri bir güvenlik
+> uyarısı gösterebilir. KonsolLink’i yalnızca bu deponun resmi Releases
+> bölümünden indirin ve gerekirse yayımlanan SHA-256 özetiyle dosyayı doğrulayın.
 
 ### 2. Konsol ağını ayarla
 
@@ -84,7 +110,8 @@ izleyip bağlantıyı manuel olarak düzenleyin:
 4. Konsolun internet bağlantısını ve ardından Discord’u aç.
 
 KonsolLink etkin olmadan yukarıdaki manuel ağ ayarlarıyla konsolun internete
-çıkamaması beklenen davranıştır; Mac bu yapılandırmada konsolun yerel ağ geçididir.
+çıkamaması beklenen davranıştır; KonsolLink’in çalıştığı bilgisayar bu
+yapılandırmada konsolun yerel ağ geçididir.
 
 ### 4. Kullanmayı bıraktığında
 
@@ -93,7 +120,8 @@ KonsolLink etkin olmadan yukarıdaki manuel ağ ayarlarıyla konsolun internete
 3. PlayStation’da IP, DNS ve MTU ayarlarını yeniden **Otomatik** yap.
 
 Manuel ağ geçidi ayarını açık bırakırsanız KonsolLink kapalıyken konsol internete
-bağlanamaz. Mac’i kapatmadan veya ağdan ayırmadan önce de aynı işlemi uygulayın.
+bağlanamaz. KonsolLink’in çalıştığı bilgisayarı kapatmadan veya ağdan ayırmadan önce de
+aynı işlemi uygulayın.
 
 ## Nasıl çalışır?
 
@@ -110,9 +138,9 @@ Bilgisayar üzerindeki yerel KonsolLink ağ geçidi
 
 KonsolLink konsola `172.24.2.1` adresinde yerel bir ağ geçidi sunar. Discord’a
 ait alan adları kapalı bir izin listesiyle sınıflandırılır. Yalnızca gerekli
-Discord TCP bağlantıları Mac üzerindeki yerel DPI uyumluluk motorundan geçer;
-oyun ve diğer trafik bu motora yönlendirilmez. DNS çözümleme de yerel ağ geçidi
-tarafından yapılır.
+Discord TCP bağlantıları bilgisayar üzerindeki yerel DPI uyumluluk motorundan
+geçer; oyun ve diğer trafik bu motora yönlendirilmez. DNS çözümleme de yerel ağ
+geçidi tarafından yapılır.
 
 - Uzak VPN veya genel amaçlı proxy yoktur.
 - Discord hesabı/parolası istenmez ve saklanmaz.
@@ -127,24 +155,25 @@ güvenlik sınırları için [güvenlik belgesine](docs/SECURITY.md) bakabilirsi
 ## Bilinen sınırlar
 
 - Destek şu an Türkiye ve Türk Telekom odaklıdır; farklı ISS’lerde çalışma garantisi yoktur.
-- Windows ve Linux uygulamaları yayıma hazır değildir.
+- Linux uygulaması yayıma hazır değildir.
 - Modem ağı `172.24.0.0/16` aralığını kullanıyorsa adres çakışması yaşanabilir.
 - VPN, İnternet Paylaşımı veya başka DPI araçları aynı anda çalışırsa başlatma engellenebilir.
 - ISS veya Discord altyapısındaki değişiklikler mevcut profilin güncellenmesini gerektirebilir.
 
 ## Sorun bildirimi ve güvenlik
 
-Hata bildirirken işletim sistemi sürümünü, Mac modelini, konsol modelini, ISS’yi
-ve uygulamadaki hata metnini ekleyin. Discord kullanıcı adı, parola, token, tam
-paket yakalama veya kişisel ağ bilgilerini herkese açık bir issue içinde
-paylaşmayın. Güvenlik açıkları için [SECURITY.md](SECURITY.md) yönergelerini izleyin.
+Hata bildirirken işletim sistemi sürümünü, bilgisayar modelini veya temel donanım
+bilgilerini, konsol modelini, ISS’yi ve uygulamadaki hata metnini ekleyin.
+Discord kullanıcı adı, parola, token, tam paket yakalama veya kişisel ağ
+bilgilerini herkese açık bir issue içinde paylaşmayın. Güvenlik açıkları için
+[SECURITY.md](SECURITY.md) yönergelerini izleyin.
 
 ## Geliştirme
 
 Proje Rust ve Tauri 2 kullanır. Katkıda bulunmadan önce
-[CONTRIBUTING.md](CONTRIBUTING.md) dosyasını okuyun. Windows ve Linux kodunun
-depoda bulunması bu platformların desteklendiği anlamına gelmez. Fiziksel kabul
-matrisi tamamlanmadan bunlar kararlı sürüm olarak işaretlenmemelidir.
+[CONTRIBUTING.md](CONTRIBUTING.md) dosyasını okuyun. Linux kodunun depoda
+bulunması bu platformun desteklendiği anlamına gelmez. Fiziksel kabul matrisi
+tamamlanmadan Linux kararlı sürüm olarak işaretlenmemelidir.
 
 Temel geliştirme kontrolleri:
 
