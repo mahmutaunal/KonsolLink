@@ -20,7 +20,6 @@ const message = byId<HTMLElement>('status');
 
 let current: Status | null = null;
 let connected = false;
-let owned = false;
 let busy = false;
 let polling = false;
 let latchedError: string | null = null;
@@ -33,6 +32,9 @@ function setState(el: HTMLElement, kind: 'off' | 'wait' | 'good', label: string)
 function friendlyError(raw: unknown): string {
   const detail = String(raw ?? '').trim();
   const value = detail.toLocaleLowerCase('tr-TR');
+  if (value.includes('windows ağ kontrolü:')) {
+    return detail;
+  }
   if (value.includes('transparent discord api readiness')) {
     return `Discord API bağlantısı şeffaf yerel yoldan tamamlanamadı. Teknik ayrıntı: ${detail}`;
   }
@@ -91,14 +93,14 @@ function render(status: Status) {
 }
 
 function controls() {
-  const active = current?.state === 'gateway_active' && !current.error;
+  const active = current?.state === 'gateway_active';
   toggle.disabled = busy || !connected || (!active && !ready.checked);
   toggle.classList.toggle('stop', Boolean(active));
   toggle.textContent = busy ? 'İşlem tamamlanıyor…' : active ? 'KonsolLink’i kapat' : connected ? 'KonsolLink’i aç' : 'KonsolLink hazırlanıyor…';
   ready.disabled = active || busy;
 }
 
-async function request(action: 'status' | 'heartbeat' | 'start' | 'stop', background = false) {
+async function request(action: 'status' | 'start' | 'stop', background = false) {
   if (busy || (background && polling)) return;
   if (!background && (action === 'start' || action === 'stop')) latchedError = null;
   if (background) polling = true;
@@ -111,12 +113,9 @@ async function request(action: 'status' | 'heartbeat' | 'start' | 'stop', backgr
       exclusiveHost: ready.checked,
     });
     connected = true;
-    if (action === 'start' && status.state === 'gateway_active' && !status.error) owned = true;
-    if (status.state !== 'gateway_active') owned = false;
     render(status);
   } catch (error) {
     connected = false;
-    owned = false;
     current = null;
     latchedError = String(error ?? 'Bilinmeyen bağlantı hatası');
     setState(gateway, 'off', 'Ulaşılamıyor');
@@ -133,5 +132,12 @@ async function request(action: 'status' | 'heartbeat' | 'start' | 'stop', backgr
 toggle.addEventListener('click', () => void request(current?.state === 'gateway_active' ? 'stop' : 'start'));
 ready.addEventListener('change', controls);
 
-setInterval(() => void request(owned ? 'heartbeat' : 'status', true), 3000);
+// Visibility affects only presentation refresh, never the native session.
+setInterval(() => {
+  if (document.visibilityState === 'visible') void request('status', true);
+}, 5000);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') void request('status', true);
+});
+window.addEventListener('focus', () => void request('status', true));
 void request('status');

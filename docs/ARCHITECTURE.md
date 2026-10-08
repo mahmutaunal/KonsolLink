@@ -56,3 +56,25 @@ console uses its separate virtual address. DPI transformation remains
 Discord-only; direct flows never enter the DPI engine. M3 measures the gateway
 cost separately and enforces the release targets of no more than 1% non-Discord
 throughput loss and under 1 ms median added LAN latency.
+
+## macOS session lifetime
+
+The native desktop process holds one authenticated Unix socket for the active
+session. There is no heartbeat or idle lease timeout: background WebView timer
+throttling cannot stop the gateway. Closing the window hides it; Quit or process
+exit closes the socket and the helper rolls back. A frozen UI with a live socket
+does not stop a healthy gateway. Status polling is informational only.
+
+The launchd helper owns a scoped IOKit idle-system-sleep assertion during the
+session. It allows display sleep and is released on stop or helper exit. This
+does not override lid closure, explicit sleep, shutdown, or a disconnected LAN.
+
+Periodic topology and Discord probes run in workers using immutable snapshots;
+only the helper loop applies policy and consumes results. Stop discards pending
+results. Engine stderr is continuously drained into an 8 KiB tail. Recovery
+continues independent operations after errors, retaining each unfinished step;
+forwarding restoration still waits for engine termination. The latest bounded
+operational failure is private in the journal directory and available through
+root-only `journal-status`, without recording packet contents or DNS history.
+
+IPC protocol version 4 requires the desktop and helper to be upgraded together.

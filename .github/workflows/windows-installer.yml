@@ -61,6 +61,7 @@ jobs:
           $source = Join-Path $env:GITHUB_WORKSPACE 'target/m4/go-pcap2socks'
           $binary = Join-Path $env:GITHUB_WORKSPACE 'target/m4/windows/go-pcap2socks.exe'
           $patch = Join-Path $env:GITHUB_WORKSPACE 'engines/go-pcap2socks-ec407738-konsollink.patch'
+          $healthPatch = Join-Path $env:GITHUB_WORKSPACE 'engines/go-pcap2socks-windows-health.patch'
           New-Item -ItemType Directory -Force -Path $source, (Split-Path $binary) | Out-Null
           git -C $source init
           if ($LASTEXITCODE -ne 0) { throw 'Gateway checkout initialization failed.' }
@@ -78,6 +79,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Gateway patch does not apply.' }
           git -C $source apply $patch
           if ($LASTEXITCODE -ne 0) { throw 'Gateway patch application failed.' }
+          git -C $source apply --check $healthPatch
+          if ($LASTEXITCODE -ne 0) { throw 'Windows health patch does not apply.' }
+          git -C $source apply $healthPatch
+          if ($LASTEXITCODE -ne 0) { throw 'Windows health patch application failed.' }
           Push-Location $source
           try {
             go mod download
@@ -85,6 +90,8 @@ jobs:
             $env:GOOS = 'windows'
             $env:GOARCH = 'amd64'
             $env:CGO_ENABLED = '0'
+            go test ./...
+            if ($LASTEXITCODE -ne 0) { throw 'Patched gateway tests failed.' }
             go build -trimpath -ldflags='-s -w' -o $binary .
             if ($LASTEXITCODE -ne 0) { throw 'Patched gateway build failed.' }
           } finally {

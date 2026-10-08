@@ -16,6 +16,8 @@ use serde::Serialize;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Instant;
 use std::{ffi::CStr, mem, net::Ipv4Addr};
 
@@ -72,6 +74,8 @@ pub struct Backend {
     policy_input: Vec<u8>,
     policy_generation: u64,
     readiness_targets: Vec<(String, Ipv4Addr)>,
+    readiness_job: Option<(u64, Receiver<Result<()>>)>,
+    health_job: Option<Receiver<Result<()>>>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +102,8 @@ impl Backend {
             policy_input: Vec::new(),
             policy_generation: 0,
             readiness_targets: Vec::new(),
+            readiness_job: None,
+            health_job: None,
         })
     }
     fn pf(&mut self) -> Result<&mut PfCtl> {
@@ -256,6 +262,8 @@ impl Backend {
         self.policy_input.clear();
         self.policy_generation = 0;
         self.readiness_targets.clear();
+        self.readiness_job = None;
+        self.health_job = None;
     }
     pub fn m2_snapshot(
         &mut self,
@@ -283,8 +291,67 @@ impl Backend {
         })
     }
     pub fn userspace_readiness(&mut self) -> Result<()> {
-        let api_address = self
-            .readiness_targets
+        Self::probe_readiness(&self.readiness_targets)
+    }
+
+    /// Background jobs own immutable snapshots; old-session results are dropped
+    /// at stop and cannot mutate PF or a replacement session.
+    pub fn runtime_readiness(&mut self) -> Result<Option<()>> {
+        if let Some((generation, job)) = &self.readiness_job {
+            match job.try_recv() {
+                Ok(result) => {
+                    let current = *generation == self.policy_generation;
+                    self.readiness_job = None;
+                    // Never act on old DNS policy results or run overlapping
+                    // probes when policy changes during a pending check.
+                    return if current { result.map(Some) } else { Ok(None) };
+                }
+                Err(TryRecvError::Empty) => return Ok(None),
+                Err(TryRecvError::Disconnected) => {
+                    self.readiness_job = None;
+                    return Err(fail("readiness worker stopped"));
+                }
+            }
+        }
+        let targets = self.readiness_targets.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("gateway-readiness".into())
+            .spawn(move || {
+                let _ = tx.send(Self::probe_readiness(&targets));
+            })?;
+        self.readiness_job = Some((self.policy_generation, rx));
+        Ok(None)
+    }
+
+    pub fn runtime_health(&mut self, plan: &Plan) -> Result<()> {
+        if let Some(job) = &self.health_job {
+            match job.try_recv() {
+                Ok(result) => {
+                    self.health_job = None;
+                    return result;
+                }
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => {
+                    self.health_job = None;
+                    return Err(fail("health worker stopped"));
+                }
+            }
+        }
+        let plan = plan.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("gateway-health".into())
+            .spawn(move || {
+                let result = Self::new().and_then(|mut backend| backend.health(&plan));
+                let _ = tx.send(result);
+            })?;
+        self.health_job = Some(rx);
+        Ok(())
+    }
+
+    fn probe_readiness(targets: &[(String, Ipv4Addr)]) -> Result<()> {
+        let api_address = targets
             .iter()
             .find(|(domain, _)| domain == "discord.com")
             .map(|(_, address)| *address)
@@ -333,8 +400,7 @@ impl Backend {
         // The console needs Discord's persistent Gateway, not merely one REST
         // response. A valid WebSocket upgrade proves TCP, TLS, SNI, HTTP/1.1
         // upgrade and the gateway.discord.gg path through transparent tpws.
-        let gateway_address = self
-            .readiness_targets
+        let gateway_address = targets
             .iter()
             .find(|(domain, _)| domain == "gateway.discord.gg")
             .map(|(_, address)| *address)
@@ -776,5 +842,64 @@ impl ProcessBackend for Backend {
 
     fn engine_health(&mut self, process: ProcessIdentity) -> Result<()> {
         self.engine.health(process)
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+
+    fn backend() -> Backend {
+        Backend {
+            pf: None,
+            observer: None,
+            dns_proxy: None,
+            observer_started: None,
+            ignored_packets: 0,
+            malformed_packets: 0,
+            engine: ProcessAdapter::new(),
+            policy_input: Vec::new(),
+            policy_generation: 0,
+            readiness_targets: Vec::new(),
+            readiness_job: None,
+            health_job: None,
+        }
+    }
+
+    #[test]
+    fn pending_probe_does_not_block_and_stop_discards_old_results() {
+        let mut backend = backend();
+        let (tx, rx) = mpsc::channel();
+        backend.readiness_job = Some((0, rx));
+        let started = Instant::now();
+        assert!(backend.runtime_readiness().unwrap().is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(backend.readiness_job.is_some());
+        backend.stop_observer();
+        assert!(tx.send(Err(fail("old session"))).is_err());
+        assert!(backend.readiness_job.is_none());
+    }
+
+    #[test]
+    fn old_policy_probe_failure_cannot_stop_current_policy() {
+        let mut backend = backend();
+        let (tx, rx) = mpsc::channel();
+        backend.readiness_job = Some((0, rx));
+        backend.policy_generation = 1;
+        assert!(backend.runtime_readiness().unwrap().is_none());
+        assert!(backend.readiness_job.is_some());
+        tx.send(Err(fail("old DNS policy"))).unwrap();
+        assert!(backend.runtime_readiness().unwrap().is_none());
+        assert!(backend.readiness_job.is_none());
+    }
+
+    #[test]
+    fn completed_probe_error_is_consumed_once() {
+        let mut backend = backend();
+        let (tx, rx) = mpsc::channel();
+        backend.readiness_job = Some((0, rx));
+        tx.send(Err(fail("probe failed"))).unwrap();
+        assert!(backend.runtime_readiness().is_err());
+        assert!(backend.readiness_job.is_none());
     }
 }

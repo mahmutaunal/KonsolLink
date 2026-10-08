@@ -32,6 +32,12 @@ if ((Get-FileHash -Algorithm SHA256 $GoodbyeDpiArchive).Hash.ToLowerInvariant() 
     throw 'GoodbyeDPI archive SHA-256 mismatch.'
 }
 
+# Refuse an older gateway that cannot answer the service health protocol.
+$HealthVersion = (& $GatewayBinary 'konsollink-health-version' | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $HealthVersion -ne 'konsollink-windows-health-v1') {
+    throw 'Rebuild the Windows gateway with the Windows Installer GitHub Actions workflow before packaging.'
+}
+
 $ServiceDir = Join-Path $Root 'platform\windows\service'
 Push-Location $ServiceDir
 $PreviousGoProxy = $env:GOPROXY
@@ -66,6 +72,7 @@ Copy-Item (Join-Path $Root 'engines\gateway-windows.json') $Package
 Copy-Item (Join-Path $Root 'platform\windows\install.ps1') $Package
 Copy-Item (Join-Path $Extract 'goodbyedpi-0.2.2\licenses') $Package -Recurse
 Copy-Item (Join-Path $Root 'engines\go-pcap2socks-ec407738-konsollink.patch') $Package
+Copy-Item (Join-Path $Root 'engines\go-pcap2socks-windows-health.patch') $Package
 Copy-Item (Join-Path $Root 'engines\go-pcap2socks-LICENSE') $Package
 Copy-Item (Join-Path $Root 'THIRD_PARTY_NOTICES.md') $Package
 $GatewaySourceArchive = Join-Path $Package 'go-pcap2socks-ec407738-source.zip'
@@ -85,7 +92,7 @@ $files = @{}
 foreach ($name in @('WinDivert.dll','WinDivert64.sys','discord-hosts.txt','gateway-windows.json','go-pcap2socks.exe','goodbyedpi.exe')) {
     $files[$name] = (Get-FileHash -Algorithm SHA256 (Join-Path $Package $name)).Hash.ToLowerInvariant()
 }
-@{ schema = 1; files = $files } | ConvertTo-Json -Depth 3 | Set-Content -Encoding utf8NoBOM (Join-Path $Package 'runtime-manifest.json')
+@{ schema = 1; health_schema = 1; files = $files } | ConvertTo-Json -Depth 3 | Set-Content -Encoding utf8NoBOM (Join-Path $Package 'runtime-manifest.json')
 @{
     schema = 1
     service_sha256 = (Get-FileHash -Algorithm SHA256 (Join-Path $Package 'KonsolLinkService.exe')).Hash.ToLowerInvariant()

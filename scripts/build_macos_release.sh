@@ -8,7 +8,7 @@ readonly ROOT
 readonly VERSION=1.0.0
 ARCH=$(uname -m)
 readonly ARCH
-readonly OUT="$ROOT/target/release-packages/macos"
+readonly OUT="${KONSOLLINK_MACOS_OUT:-$ROOT/target/release-packages/macos}"
 readonly APP_IDENTITY=${APPLE_APPLICATION_IDENTITY:-}
 readonly INSTALLER_IDENTITY=${APPLE_INSTALLER_IDENTITY:-}
 readonly UNSIGNED=${ALLOW_UNSIGNED_RC:-0}

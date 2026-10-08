@@ -19,7 +19,7 @@ use std::{
     },
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 const USERSPACE_READINESS_REFRESH: Duration = Duration::from_secs(45);
@@ -43,6 +43,9 @@ struct Peer {
 trait BackendOps: ProcessBackend {
     fn plan(&mut self, console: Ipv4Addr) -> crate::journal::Result<Plan>;
     fn health(&mut self, plan: &Plan) -> crate::journal::Result<()>;
+    fn runtime_readiness(&mut self) -> crate::journal::Result<Option<()>> {
+        self.userspace_readiness().map(Some)
+    }
     fn start_observer(&mut self, plan: &Plan) -> crate::journal::Result<ObservationStatus>;
     fn poll_observer(&mut self) -> crate::journal::Result<ObservationStatus>;
     fn m2_snapshot(
@@ -72,6 +75,9 @@ impl BackendOps for Backend {
     }
     fn health(&mut self, plan: &Plan) -> crate::journal::Result<()> {
         Backend::health(self, plan)
+    }
+    fn runtime_readiness(&mut self) -> crate::journal::Result<Option<()>> {
+        Backend::runtime_readiness(self)
     }
     fn start_observer(&mut self, plan: &Plan) -> crate::journal::Result<ObservationStatus> {
         Backend::start_observer(self, plan)
@@ -113,6 +119,14 @@ impl BackendOps for Backend {
     }
 }
 
+type StartedSession = (
+    Plan,
+    ObservationStatus,
+    bool,
+    usize,
+    crate::power::SessionPower,
+);
+
 struct ActiveSample {
     expected: ExpectedSample,
     before: ObservationStatus,
@@ -123,8 +137,7 @@ struct Runtime<B: BackendOps> {
     backend: B,
     status: Status,
     owner: Option<u64>,
-    last_heartbeat: Instant,
-    last_wall_heartbeat: SystemTime,
+    power: Option<crate::power::SessionPower>,
     evaluator: ShadowEvaluator,
     active_sample: Option<ActiveSample>,
     proof: Option<QualifiedShadowRun>,
@@ -196,18 +209,8 @@ impl<B: BackendOps> Runtime<B> {
         }
     }
 
-    fn expired(&self) -> bool {
-        self.last_heartbeat.elapsed() >= LEASE
-            || self.last_wall_heartbeat.elapsed().unwrap_or(LEASE) >= LEASE
-    }
     fn disconnected(&mut self, id: u64) -> Result<(), Box<dyn std::error::Error>> {
         if self.owner == Some(id) {
-            self.stop()?;
-        }
-        Ok(())
-    }
-    fn watchdog(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.owner.is_some() && self.expired() {
             self.stop()?;
         }
         Ok(())
@@ -220,6 +223,7 @@ impl<B: BackendOps> Runtime<B> {
             Ok(observation) => self.status.observation = observation,
             Err(error) => {
                 let message = format!("observation stopped safely: {error}");
+                let _ = self.store.record_failure(&message);
                 self.stop()?;
                 self.status.error = Some(message);
             }
@@ -266,6 +270,7 @@ impl<B: BackendOps> Runtime<B> {
                         self.backend
                             .acknowledge_userspace_policy(&update, Some(&detail))?;
                         let message = format!("Discord DNS policy stopped safely: {error}");
+                        let _ = self.store.record_failure(&message);
                         self.stop()?;
                         self.status.error = Some(message);
                         return Ok(());
@@ -273,19 +278,24 @@ impl<B: BackendOps> Runtime<B> {
                 }
             }
             if self.userspace_readiness_at.elapsed() >= USERSPACE_READINESS_REFRESH {
-                if let Err(error) = self.backend.userspace_readiness() {
-                    let current_is_valid = self
-                        .store
-                        .load()?
-                        .and_then(|journal| journal.interception)
-                        .is_some_and(|record| record.plan.is_current(now_secs));
-                    if !current_is_valid {
-                        let message = format!("Discord transparent route stopped safely: {error}");
-                        self.stop()?;
-                        self.status.error = Some(message);
+                match self.backend.runtime_readiness() {
+                    Ok(None) => {} // Probe is pending; keep serving IPC and policy ACKs.
+                    Ok(Some(())) => self.userspace_readiness_at = Instant::now(),
+                    Err(error) => {
+                        self.userspace_readiness_at = Instant::now();
+                        let current_is_valid = self
+                            .store
+                            .load()?
+                            .and_then(|journal| journal.interception)
+                            .is_some_and(|record| record.plan.is_current(now_secs));
+                        if !current_is_valid {
+                            let message =
+                                format!("Discord transparent route stopped safely: {error}");
+                            let _ = self.store.record_failure(&message);
+                            self.stop()?;
+                            self.status.error = Some(message);
+                        }
                     }
-                } else {
-                    self.userspace_readiness_at = Instant::now();
                 }
             }
             return Ok(());
@@ -308,6 +318,7 @@ impl<B: BackendOps> Runtime<B> {
             }
             Err(error) => {
                 let message = format!("Discord bypass stopped safely: {error}");
+                let _ = self.store.record_failure(&message);
                 self.stop()?;
                 self.status.error = Some(message);
             }
@@ -428,7 +439,12 @@ impl<B: BackendOps> Runtime<B> {
     fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.owner = None;
         self.backend.stop_observer();
-        self.store.rollback(&mut self.backend)?;
+        let recovery = self.store.rollback(&mut self.backend);
+        self.power = None;
+        if let Err(error) = recovery {
+            let _ = self.store.record_failure(&error.to_string());
+            return Err(error.into());
+        }
         self.status = Status::off();
         self.evaluator = ShadowEvaluator::default();
         self.active_sample = None;
@@ -436,32 +452,24 @@ impl<B: BackendOps> Runtime<B> {
         Ok(())
     }
     fn command(&mut self, id: u64, command: Command) -> Result<Status, Box<dyn std::error::Error>> {
-        self.watchdog()?;
         match command {
             Command::Status {} => {}
             Command::Stop {} => self.stop()?,
-            Command::Heartbeat {} => {
-                if self.owner != Some(id) {
-                    return Ok(self.denied("connection does not own the gateway lease"));
-                }
-                self.last_heartbeat = Instant::now();
-                self.last_wall_heartbeat = SystemTime::now();
-            }
             Command::BeginSample { expected } => {
                 if self.owner != Some(id) {
-                    return Ok(self.denied("connection does not own the gateway lease"));
+                    return Ok(self.denied("connection does not own the gateway session"));
                 }
                 return Ok(self.begin_sample(expected));
             }
             Command::FinishSample {} => {
                 if self.owner != Some(id) {
-                    return Ok(self.denied("connection does not own the gateway lease"));
+                    return Ok(self.denied("connection does not own the gateway session"));
                 }
                 return self.finish_sample();
             }
             Command::ResetQualification {} => {
                 if self.owner != Some(id) {
-                    return Ok(self.denied("connection does not own the gateway lease"));
+                    return Ok(self.denied("connection does not own the gateway session"));
                 }
                 self.reset_qualification()?
             }
@@ -477,24 +485,25 @@ impl<B: BackendOps> Runtime<B> {
                 if !ipv4_only_confirmed || !exclusive_host_confirmed {
                     return Ok(self.denied("M0 requires confirmed IPv4-only console/router and exclusive test-host use"));
                 }
-                let result =
-                    (|| -> Result<(Plan, ObservationStatus, bool, usize), Box<dyn std::error::Error>> {
-                        let plan = self.backend.plan(console)?;
-                        self.store
-                            .prepare_gateway(&mut self.backend, plan.clone())?;
-                        self.store.apply(&mut self.backend)?;
-                        self.backend.health(&plan)?;
-                        let observation = self.backend.start_observer(&plan)?;
-                        let integrated = plan.mode == Mode::Userspace;
-                        let destinations = if integrated {
-                            self.start_userspace(&plan)?
-                        } else {
-                            0
-                        };
-                        Ok((plan, observation, integrated, destinations))
-                    })();
+                let result = (|| -> Result<StartedSession, Box<dyn std::error::Error>> {
+                    self.store.rollback(&mut self.backend)?;
+                    let power = crate::power::SessionPower::acquire()?;
+                    let plan = self.backend.plan(console)?;
+                    self.store
+                        .prepare_gateway(&mut self.backend, plan.clone())?;
+                    self.store.apply(&mut self.backend)?;
+                    self.backend.health(&plan)?;
+                    let observation = self.backend.start_observer(&plan)?;
+                    let integrated = plan.mode == Mode::Userspace;
+                    let destinations = if integrated {
+                        self.start_userspace(&plan)?
+                    } else {
+                        0
+                    };
+                    Ok((plan, observation, integrated, destinations, power))
+                })();
                 match result {
-                    Ok((plan, observation, integrated, destinations)) => {
+                    Ok((plan, observation, integrated, destinations, power)) => {
                         self.status = Status {
                             version: VERSION,
                             state: "gateway_active".into(),
@@ -510,11 +519,11 @@ impl<B: BackendOps> Runtime<B> {
                             error: None,
                         };
                         self.owner = Some(id);
-                        self.last_heartbeat = Instant::now();
-                        self.last_wall_heartbeat = SystemTime::now();
+                        self.power = Some(power);
                     }
                     Err(error) => {
                         let message = error.to_string();
+                        let _ = self.store.record_failure(&message);
                         // Persistence failures poison the Store: exiting lets launchd
                         // reopen durable evidence and recover, without erasing it.
                         self.stop()?;
@@ -574,8 +583,7 @@ pub fn serve(uid: u32) -> Result<(), Box<dyn std::error::Error>> {
         backend,
         status: Status::off(),
         owner: None,
-        last_heartbeat: Instant::now(),
-        last_wall_heartbeat: SystemTime::now(),
+        power: None,
         evaluator: ShadowEvaluator::default(),
         active_sample: None,
         proof: None,
@@ -587,13 +595,12 @@ pub fn serve(uid: u32) -> Result<(), Box<dyn std::error::Error>> {
     let mut health_at = Instant::now();
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         while !STOP.load(Ordering::SeqCst) {
-            runtime.watchdog()?;
             runtime.poll_observer()?;
             runtime.poll_m2()?;
             if runtime.owner.is_some() && health_at.elapsed() >= Duration::from_secs(3) {
                 health_at = Instant::now();
                 if let Some(plan) = &runtime.status.gateway {
-                    let health = runtime.backend.health(plan).and_then(|_| {
+                    let health = runtime.backend.runtime_health(plan).and_then(|_| {
                         let journal = runtime.store.load()?;
                         if let Some(process) =
                             journal.and_then(|j| j.engine).and_then(|e| e.process)
@@ -604,6 +611,7 @@ pub fn serve(uid: u32) -> Result<(), Box<dyn std::error::Error>> {
                     });
                     if let Err(error) = health {
                         let message = error.to_string();
+                        let _ = runtime.store.record_failure(&message);
                         runtime.stop()?;
                         runtime.status.error = Some(message);
                     }
@@ -654,7 +662,7 @@ pub fn serve(uid: u32) -> Result<(), Box<dyn std::error::Error>> {
                                                 runtime.command(p.id, request.command)?;
                                             let mut bytes = serde_json::to_vec(&response)?;
                                             bytes.push(b'\n');
-                                            // Small bounded response; a slow reader loses its lease.
+                                            // Small bounded response; a disconnected reader loses its session.
                                             if p.stream.write_all(&bytes).is_err() {
                                                 closed = true;
                                             }
@@ -683,6 +691,9 @@ pub fn serve(uid: u32) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })();
     // On errors preserve journal. Supervisor restarts and recovers it.
+    if let Err(error) = &result {
+        let _ = runtime.store.record_failure(&error.to_string());
+    }
     if result.is_ok()
         && runtime
             .store
@@ -802,7 +813,7 @@ mod tests {
         }
     }
     #[test]
-    fn lease_owner_disconnect_timeout_and_explicit_stop_restore_settings() {
+    fn socket_owner_disconnect_and_explicit_stop_restore_settings() {
         let path =
             std::env::temp_dir().join(format!("konsollink-lease-test-{}", std::process::id()));
         fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
@@ -817,8 +828,7 @@ mod tests {
             },
             status: Status::off(),
             owner: None,
-            last_heartbeat: Instant::now(),
-            last_wall_heartbeat: SystemTime::now(),
+            power: None,
             evaluator: ShadowEvaluator::default(),
             active_sample: None,
             proof: None,
@@ -842,31 +852,22 @@ mod tests {
             .unwrap();
         assert!(response.error.is_some());
         assert!(runtime.store.load().unwrap().is_none());
-        for mode in 0..4 {
+        for mode in 0..2 {
             assert_eq!(runtime.command(1, start()).unwrap().state, "gateway_active");
-            let deadline = runtime.last_heartbeat;
-            assert!(runtime
-                .command(2, Command::Heartbeat {})
-                .unwrap()
-                .error
-                .is_some());
-            assert_eq!(deadline, runtime.last_heartbeat);
             assert!(runtime.command(2, start()).unwrap().error.is_some());
             runtime.disconnected(2).unwrap();
             assert!(runtime.backend.gateway_active);
             assert!(runtime.backend.observer_active);
+            // Neither a delayed UI nor a wall-clock gap expires this socket-owned session.
+            runtime.userspace_started_at = Instant::now() - Duration::from_secs(3600);
+            assert_eq!(
+                runtime.command(2, Command::Status {}).unwrap().state,
+                "gateway_active"
+            );
             runtime.poll_observer().unwrap();
             assert_eq!(runtime.status.observation.captured_packets, 1);
             match mode {
                 0 => runtime.disconnected(1).unwrap(),
-                1 => {
-                    runtime.last_heartbeat = Instant::now() - LEASE;
-                    runtime.watchdog().unwrap();
-                }
-                2 => {
-                    runtime.last_wall_heartbeat = SystemTime::now() - LEASE;
-                    runtime.watchdog().unwrap();
-                }
                 _ => {
                     runtime.command(2, Command::Stop {}).unwrap();
                 }
@@ -898,8 +899,7 @@ mod tests {
             },
             status: Status::off(),
             owner: None,
-            last_heartbeat: Instant::now(),
-            last_wall_heartbeat: SystemTime::now(),
+            power: None,
             evaluator: ShadowEvaluator::default(),
             active_sample: None,
             proof: None,
@@ -955,8 +955,7 @@ mod tests {
             },
             status: Status::off(),
             owner: None,
-            last_heartbeat: Instant::now(),
-            last_wall_heartbeat: SystemTime::now(),
+            power: None,
             evaluator: ShadowEvaluator::default(),
             active_sample: None,
             proof: None,

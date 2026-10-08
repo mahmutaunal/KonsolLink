@@ -10,9 +10,8 @@ use std::{
 
 pub const SOCKET_DIR: &str = "/private/var/db/konsollink-ipc";
 pub const SOCKET: &str = "/private/var/db/konsollink-ipc/helper.sock";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 pub const MAX_FRAME: usize = 4096;
-pub const LEASE: Duration = Duration::from_secs(15);
 #[cfg(target_os = "macos")]
 mod server;
 #[cfg(target_os = "macos")]
@@ -33,7 +32,6 @@ pub enum Command {
         ipv4_only_confirmed: bool,
         exclusive_host_confirmed: bool,
     },
-    Heartbeat {},
     BeginSample {
         expected: ExpectedSample,
     },
@@ -229,16 +227,16 @@ mod tests {
     #[test]
     fn protocol_is_closed_versioned_and_bounded() {
         for raw in [
-            r#"{"version":4,"command":{"type":"status"}}"#,
-            r#"{"version":3,"command":{"type":"shell","args":"id"}}"#,
-            r#"{"version":3,"command":{"type":"status","path":"/etc/pf.conf"}}"#,
-            r#"{"version":3,"command":{"type":"start","console":"127.0.0.1"}}"#,
-            r#"{"version":3,"command":{"type":"status"},"extra":true}"#,
+            r#"{"version":2,"command":{"type":"status"}}"#,
+            r#"{"version":4,"command":{"type":"shell","args":"id"}}"#,
+            r#"{"version":4,"command":{"type":"status","path":"/etc/pf.conf"}}"#,
+            r#"{"version":4,"command":{"type":"start","console":"127.0.0.1"}}"#,
+            r#"{"version":4,"command":{"type":"status"},"extra":true}"#,
         ] {
             assert!(decode(raw.as_bytes()).is_err(), "{raw}");
         }
         assert!(decode(&vec![b' '; MAX_FRAME + 1]).is_err());
-        assert!(decode(br#"{"version":3,"command":{"type":"status"}}"#).is_ok());
+        assert!(decode(br#"{"version":4,"command":{"type":"status"}}"#).is_ok());
     }
     #[test]
     fn framing_rejects_truncated_and_oversized_input() {

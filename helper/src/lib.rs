@@ -13,3 +13,6 @@ pub mod ipc;
 pub mod journal;
 #[cfg(unix)]
 pub mod runtime;
+
+#[cfg(target_os = "macos")]
+mod power;

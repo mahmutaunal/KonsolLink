@@ -60,10 +60,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             eprintln!("M0 IPv4 gateway trial; Discord bypass is OFF. Keep this terminal open. Ctrl-C disconnects and rolls back.");
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                let response = client.request(Command::Heartbeat {})?;
+                let response = client.request(Command::Status {})?;
                 if response.state != "gateway_active" || response.error.is_some() {
                     println!("{}", serde_json::to_string_pretty(&response)?);
-                    return Err("gateway lease ended; restore console gateway to router".into());
+                    return Err("gateway session ended; restore console gateway to router".into());
                 }
             }
         }
@@ -83,6 +83,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "mode": "journal-status",
                     "network_changed": false,
+                    "last_failure": store.last_failure()?,
                     "recovery_required": journal.as_ref().is_some_and(|j| j.phase != Phase::Complete),
                     "journal": journal
                 }))?

@@ -113,6 +113,12 @@ KonsolLink etkin olmadan yukarıdaki manuel ağ ayarlarıyla konsolun internete
 çıkamaması beklenen davranıştır; KonsolLink’in çalıştığı bilgisayar bu
 yapılandırmada konsolun yerel ağ geçididir.
 
+macOS üzerinde etkin oturum boyunca sistemin boşta uyuması uygulama tarafından
+engellenir; ekran kapanabilir ve pencere arka planda kalabilir. Pencerenin kapatma
+düğmesi uygulamayı menü çubuğuna gizler. Menüdeki **Çıkış** uygulamayı ve oturumu
+sonlandırır. Kapak kapatılması, elle uykuya geçirme veya ağın kesilmesi bu
+korumanın kapsamına girmez.
+
 ### 4. Kullanmayı bıraktığında
 
 1. Önce uygulamada **KonsolLink’i kapat** düğmesine bas.

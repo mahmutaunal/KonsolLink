@@ -3,16 +3,23 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/eventlog"
 )
 
 const serviceName = "KonsolLink"
@@ -51,12 +58,14 @@ func newKillOnCloseJob() (windows.Handle, error) {
 	return job, nil
 }
 
-func startInJob(job windows.Handle, root, image string, args ...string) (*exec.Cmd, error) {
+func startInJob(job windows.Handle, root, image string, env []string, output *tailWriter, args ...string) (*exec.Cmd, error) {
 	path := filepath.Join(root, image)
 	command := exec.Command(path, args...)
 	command.Dir = root
-	command.Stdout = nil
-	command.Stderr = nil
+	command.Env = append(os.Environ(), env...)
+	command.Stdout = output
+	command.Stderr = output
+	command.WaitDelay = time.Second
 	if err := command.Start(); err != nil {
 		return nil, err
 	}
@@ -67,17 +76,19 @@ func startInJob(job windows.Handle, root, image string, args ...string) (*exec.C
 	)
 	if err != nil {
 		_ = command.Process.Kill()
+		_ = command.Wait()
 		return nil, err
 	}
 	defer windows.CloseHandle(handle)
 	if err := windows.AssignProcessToJobObject(job, handle); err != nil {
 		_ = command.Process.Kill()
+		_ = command.Wait()
 		return nil, err
 	}
 	return command, nil
 }
 
-func runChildren(root string, stop <-chan struct{}, ready chan<- struct{}) error {
+func runChildren(root string, stop <-chan struct{}, ready chan<- struct{}, diagnostic *diagnostics) error {
 	if err := validateManifest(root); err != nil {
 		return err
 	}
@@ -96,42 +107,103 @@ func runChildren(root string, stop <-chan struct{}, ready chan<- struct{}) error
 	if err != nil {
 		return err
 	}
-	defer windows.CloseHandle(job)
+	var children sync.WaitGroup
+	defer func() { _ = windows.CloseHandle(job); children.Wait() }()
 
-	dpi, err := startInJob(job, root, "goodbyedpi.exe", "-5", "--blacklist", filepath.Join(root, "discord-hosts.txt"))
+	// Allocate an ephemeral loopback port and a per-run authentication secret.
+	// A competing listener cannot forge the token or the expected gateway PID.
+	reservation, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	address := reservation.Addr().String()
+	_ = reservation.Close()
+	secret := make([]byte, 32)
+	if _, err = rand.Read(secret); err != nil {
+		return err
+	}
+	token := hex.EncodeToString(secret)
+	dpiOutput, gatewayOutput := &tailWriter{}, &tailWriter{}
+	exited := make(chan error, 2)
+	dpi, err := startInJob(job, root, "goodbyedpi.exe", nil, dpiOutput, "-5", "--blacklist", filepath.Join(root, "discord-hosts.txt"))
 	if err != nil {
 		return fmt.Errorf("start GoodbyeDPI: %w", err)
 	}
-	gateway, err := startInJob(job, root, "go-pcap2socks.exe", filepath.Join(root, "gateway-windows.json"))
+	children.Add(1)
+	go func() {
+		defer children.Done()
+		exited <- errors.New(errorSummary("goodbyedpi.exe", dpi.Wait(), dpiOutput))
+	}()
+	gateway, err := startInJob(job, root, "go-pcap2socks.exe", []string{"KONSOLLINK_HEALTH_ADDR=" + address, "KONSOLLINK_HEALTH_TOKEN=" + token}, gatewayOutput, filepath.Join(root, "gateway-windows.json"))
 	if err != nil {
-		return fmt.Errorf("start userspace gateway: %w", err)
+		return fmt.Errorf("start gateway: %w", err)
 	}
-	exited := make(chan error, 2)
-	go func() { exited <- dpi.Wait() }()
-	go func() { exited <- gateway.Wait() }()
+	children.Add(1)
+	go func() {
+		defer children.Done()
+		exited <- errors.New(errorSummary("go-pcap2socks.exe", gateway.Wait(), gatewayOutput))
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	defer client.CloseIdleConnections()
+	type result struct {
+		health healthResult
+		err    error
+	}
+	results := make(chan result, 1)
+	// One worker only. Starting/stopping, process supervision and SCM requests
+	// continue while DNS/TLS probes run; the GUI never participates.
+	probe := func() {
+		go func() {
+			h, e := probeHealth(ctx, client, address, token, gateway.Process.Pid)
+			select {
+			case results <- result{h, e}:
+			case <-ctx.Done():
+			}
+		}()
+	}
 	startup := time.NewTimer(500 * time.Millisecond)
+	defer startup.Stop()
 	select {
 	case <-stop:
-		startup.Stop()
 		return nil
 	case err := <-exited:
-		startup.Stop()
-		if err == nil {
-			return errors.New("a required runtime process stopped during startup")
-		}
-		return fmt.Errorf("a required runtime process failed during startup: %w", err)
+		return err
 	case <-startup.C:
 	}
-	ready <- struct{}{}
-	select {
-	case <-stop:
-		return nil
-	case err := <-exited:
-		if err == nil {
-			return errors.New("a required runtime process stopped")
-		}
-		return fmt.Errorf("a required runtime process failed: %w", err)
+	if err = diagnostic.write("checking", "Windows ağ kontrolü: ilk doğrulama bekleniyor."); err != nil {
+		return err
 	}
+	ready <- struct{}{}
+	timer := time.NewTimer(healthInterval)
+	defer timer.Stop()
+	policy := healthPolicy{}
+	probe()
+	for {
+		select {
+		case <-stop:
+			return nil
+		case err := <-exited:
+			return err
+		case <-timer.C:
+			probe()
+		case r := <-results:
+			message, restart := policy.observe(r.health, r.err)
+			state := "healthy"
+			if message != "" {
+				state = "degraded"
+			}
+			if restart {
+				return errors.New(message)
+			}
+			if err = diagnostic.write(state, message); err != nil {
+				return fmt.Errorf("write diagnostics: %w", err)
+			}
+			timer.Reset(healthInterval)
+		}
+	}
+
 }
 
 func (service) Execute(_ []string, requests <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
@@ -141,10 +213,24 @@ func (service) Execute(_ []string, requests <-chan svc.ChangeRequest, status cha
 	if err != nil {
 		return false, 1
 	}
+	diagnostic := newDiagnostics(root)
+	if err = diagnostic.write("starting", ""); err != nil {
+		reportFailure(err)
+		return false, 1
+	}
 	stop := make(chan struct{})
 	ready := make(chan struct{}, 1)
 	done := make(chan error, 1)
-	go func() { done <- runChildren(root, stop, ready) }()
+	go func() {
+		err := runChildren(root, stop, ready, diagnostic)
+		if err != nil {
+			_ = diagnostic.write("failed", err.Error())
+			reportFailure(err)
+		} else {
+			_ = diagnostic.write("stopped", "")
+		}
+		done <- err
+	}()
 	select {
 	case <-ready:
 	case <-time.After(10 * time.Second):
@@ -169,7 +255,7 @@ func (service) Execute(_ []string, requests <-chan svc.ChangeRequest, status cha
 					err = errors.New("runtime shutdown timed out")
 				}
 				if err != nil {
-					return false, 1
+					reportFailure(err)
 				}
 				return false, 0
 			}
@@ -185,5 +271,13 @@ func (service) Execute(_ []string, requests <-chan svc.ChangeRequest, status cha
 func main() {
 	if err := svc.Run(serviceName, service{}); err != nil {
 		os.Exit(1)
+	}
+}
+
+func reportFailure(err error) {
+	log, e := eventlog.Open(serviceName)
+	if e == nil {
+		defer log.Close()
+		_ = log.Error(1, err.Error())
 	}
 }

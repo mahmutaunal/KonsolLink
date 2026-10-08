@@ -21,8 +21,9 @@ var requiredRuntimeFiles = []string{
 }
 
 type manifest struct {
-	Schema int               `json:"schema"`
-	Files  map[string]string `json:"files"`
+	Schema       int               `json:"schema"`
+	HealthSchema int               `json:"health_schema"`
+	Files        map[string]string `json:"files"`
 }
 
 func validateManifest(root string) error {
@@ -34,7 +35,7 @@ func validateManifest(root string) error {
 	if err := json.Unmarshal(raw, &document); err != nil {
 		return fmt.Errorf("parse runtime manifest: %w", err)
 	}
-	if document.Schema != 1 || len(document.Files) != len(requiredRuntimeFiles) {
+	if document.Schema != 1 || document.HealthSchema != 1 || len(document.Files) != len(requiredRuntimeFiles) {
 		return fmt.Errorf("runtime manifest has an unsupported schema or file set")
 	}
 	names := make([]string, 0, len(document.Files))

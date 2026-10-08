@@ -634,3 +634,36 @@ fn routed_gateway_changes_no_pf_fixture_state() {
     assert_eq!(backend.settings.values(), [0, 0, 1]);
     assert_eq!(backend.pf_values(), [false; 3]);
 }
+
+#[test]
+fn failure_diagnostics_are_bounded_and_survive_reopen() {
+    let temp = Temp::new();
+    let store = temp.store();
+    store.record_failure(&"x".repeat(100_000)).unwrap();
+    drop(store);
+    let store = temp.store();
+    let record = store.last_failure().unwrap().unwrap();
+    assert_eq!(record["error"].as_str().unwrap().len(), 2048);
+    assert!(record["unix_seconds"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn rollback_continues_restoring_independent_settings_after_conflict() {
+    let temp = Temp::new();
+    let mut store = temp.store();
+    let mut backend = Fixture::new(&temp.0);
+    store.prepare(&mut backend, PLAN).unwrap();
+    store.apply(&mut backend).unwrap();
+    backend.write(Setting::IcmpRedirects, 7).unwrap();
+    assert!(matches!(
+        store.rollback(&mut backend),
+        Err(Error::Conflict(Setting::IcmpRedirects))
+    ));
+    assert_eq!(backend.read(Setting::Ipv4Forwarding).unwrap(), 0);
+    assert_eq!(backend.read(Setting::Ipv6Forwarding).unwrap(), 0);
+    assert_eq!(backend.read(Setting::IcmpRedirects).unwrap(), 7);
+    assert_eq!(store.load().unwrap().unwrap().phase, Phase::RollingBack);
+    backend.write(Setting::IcmpRedirects, 0).unwrap();
+    store.rollback(&mut backend).unwrap();
+    assert_eq!(backend.values(), [0, 0, 1]);
+}

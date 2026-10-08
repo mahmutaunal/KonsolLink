@@ -1,4 +1,7 @@
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -23,7 +26,6 @@ mod gateway {
     ) -> Result<Status, String> {
         let command = match action.as_str() {
             "status" => Command::Status {},
-            "heartbeat" => Command::Heartbeat {},
             "stop" => Command::Stop {},
             "sample_non_discord" => Command::BeginSample {
                 expected: ExpectedSample::NonDiscord,
@@ -44,7 +46,7 @@ mod gateway {
             _ => return Err("Bilinmeyen işlem".into()),
         };
         // Blocking socket work runs off the WebView event loop. One connection
-        // owns the lease; process death closes it, so helper rolls back.
+        // owns the session; process death closes it, so helper rolls back.
         let connection = state.0.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut client = connection
@@ -136,12 +138,13 @@ mod gateway {
             .map_err(|e| format!("Windows hizmet yöneticisi çalışmadı: {e}"))
     }
     #[cfg(target_os = "windows")]
-    fn active() -> Result<bool, String> {
+    fn service_snapshot() -> Result<(bool, u32), String> {
         use windows_sys::Win32::{
             Foundation::ERROR_SERVICE_DOES_NOT_EXIST,
             System::Services::{
-                CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
-                SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+                CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
+                SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+                SERVICE_STATUS_PROCESS,
             },
         };
 
@@ -161,18 +164,85 @@ mod gateway {
         unsafe { CloseServiceHandle(manager) };
         if handle.is_null() {
             if open_error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) {
-                return Ok(false);
+                return Ok((false, 0));
             }
             return Err(format!("KonsolLink hizmeti açılamadı: {open_error}"));
         }
-        let mut state = std::mem::MaybeUninit::<SERVICE_STATUS>::uninit();
-        let queried = unsafe { QueryServiceStatus(handle, state.as_mut_ptr()) };
+        let mut state = std::mem::MaybeUninit::<SERVICE_STATUS_PROCESS>::uninit();
+        let mut needed = 0;
+        let queried = unsafe {
+            QueryServiceStatusEx(
+                handle,
+                SC_STATUS_PROCESS_INFO,
+                state.as_mut_ptr().cast(),
+                std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
+                &mut needed,
+            )
+        };
         let query_error = std::io::Error::last_os_error();
         unsafe { CloseServiceHandle(handle) };
         if queried == 0 {
             return Err(format!("KonsolLink hizmet durumu okunamadı: {query_error}"));
         }
-        Ok(unsafe { state.assume_init() }.dwCurrentState == SERVICE_RUNNING)
+        let state = unsafe { state.assume_init() };
+        Ok((state.dwCurrentState == SERVICE_RUNNING, state.dwProcessId))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn active() -> Result<bool, String> {
+        service_snapshot().map(|(running, _)| running)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn health_error(pid: u32) -> Option<String> {
+        use std::{
+            io::Read,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        #[derive(serde::Deserialize)]
+        struct Health {
+            schema: u32,
+            pid: u32,
+            checked_unix: u64,
+            state: String,
+            error: String,
+        }
+        let unavailable = || {
+            Some(
+                "Windows ağ kontrolü: güncel motor doğrulaması bekleniyor; hizmet açık.".to_owned(),
+            )
+        };
+        let root = DeploymentContract::for_platform(HostPlatform::Windows)
+            .ok()?
+            .install_root;
+        let file =
+            match std::fs::File::open(std::path::Path::new(root).join("diagnostics/status.json")) {
+                Ok(file) => file,
+                Err(_) => return unavailable(),
+            };
+        let mut bytes = Vec::new();
+        if file.take(4097).read_to_end(&mut bytes).is_err() || bytes.len() > 4096 {
+            return unavailable();
+        }
+        let health: Health = match serde_json::from_slice(&bytes) {
+            Ok(health) => health,
+            Err(_) => return unavailable(),
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        if health.schema != 1
+            || health.pid != pid
+            || health.checked_unix > now + 5
+            || now.saturating_sub(health.checked_unix) > 120
+        {
+            return unavailable();
+        }
+        if health.state == "healthy" && health.error.is_empty() {
+            None
+        } else if !health.error.is_empty() {
+            Some(health.error)
+        } else {
+            unavailable()
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -195,7 +265,12 @@ mod gateway {
 
     fn status(error: Option<String>) -> Result<Status, String> {
         DeploymentContract::for_platform(platform())?;
+        #[cfg(target_os = "windows")]
+        let (running, pid) = service_snapshot()?;
+        #[cfg(target_os = "linux")]
         let running = active()?;
+        #[cfg(target_os = "windows")]
+        let error = error.or_else(|| if running { health_error(pid) } else { None });
         Ok(Status {
             version: 4,
             state: if running { "gateway_active" } else { "off" },
@@ -204,7 +279,7 @@ mod gateway {
                 router: GATEWAY.to_string(),
                 console: CONSOLE.to_string(),
             }),
-            discord_bypass: running,
+            discord_bypass: running && error.is_none(),
             intercepted_destinations: 0,
             qualification: Qualification {
                 state: "qualified",
@@ -234,7 +309,7 @@ mod gateway {
     ) -> Result<Status, String> {
         tauri::async_runtime::spawn_blocking(move || {
             match action.as_str() {
-                "status" | "heartbeat" => return status(None),
+                "status" => return status(None),
                 "start" => {
                     if console.as_deref() != Some("172.24.2.10") || !ipv4_only || !exclusive_host {
                         return Err("Sabit konsol adresi ve iki hazırlık onayı gerekli".into());
@@ -270,6 +345,12 @@ fn main() {
     let builder = tauri::Builder::default();
     #[cfg(target_os = "macos")]
     let builder = builder
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .manage(gateway::Connection::default())
         .invoke_handler(tauri::generate_handler![gateway::gateway_request]);
     #[cfg(any(target_os = "windows", target_os = "linux"))]

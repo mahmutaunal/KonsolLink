@@ -233,6 +233,44 @@ impl Store {
         Ok(())
     }
 
+    /// One bounded private operational failure, surviving helper restarts.
+    pub fn record_failure(&self, message: &str) -> Result<()> {
+        verify(&self.directory, self.owner, true, true)?;
+        let mut file = open_at(
+            &self.directory,
+            c"last-failure.json",
+            libc::O_RDWR | libc::O_CREAT,
+            0o600,
+        )?;
+        verify(&file, self.owner, false, true)?;
+        let message: String = message.chars().take(2048).collect();
+        let data = serde_json::to_vec(&serde_json::json!({
+            "unix_seconds": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            "error": message
+        }))?;
+        file.set_len(0)?;
+        file.write_all(&data)?;
+        durable(&file)?;
+        Ok(())
+    }
+
+    pub fn last_failure(&self) -> Result<Option<serde_json::Value>> {
+        verify(&self.directory, self.owner, true, true)?;
+        let mut file = match open_at(&self.directory, c"last-failure.json", libc::O_RDONLY, 0) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        verify(&file, self.owner, false, true)?;
+        if file.metadata()?.len() > 16384 {
+            return Err(Error::Invalid("failure record size limit"));
+        }
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        // An interrupted diagnostic write must not block gateway recovery.
+        Ok(serde_json::from_slice(&data).ok())
+    }
+
     pub(super) fn save(&mut self, journal: &Journal) -> Result<()> {
         self.check()?;
         journal.validate()?;

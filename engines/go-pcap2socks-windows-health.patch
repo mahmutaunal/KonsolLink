@@ -1,0 +1,332 @@
+diff --git a/main.go b/main.go
+--- a/main.go
++++ b/main.go
+@@ -27,6 +27,10 @@
+ 
+ func main() {
+ 	setupLogging()
++	if len(os.Args) == 2 && os.Args[1] == "konsollink-health-version" {
++		fmt.Println("konsollink-windows-health-v1")
++		return
++	}
+ 
+ 	// Check for config command
+ 	if len(os.Args) > 1 && os.Args[1] == "config" {
+@@ -92,6 +96,11 @@
+ 		return err
+ 	}
+ 	defer eng.Close()
++	closeHealth, err := startPlatformHealth(eng, ifce)
++	if err != nil {
++		return err
++	}
++	defer closeHealth()
+ 	if policy != nil {
+ 		go func() {
+ 			for {
+diff --git a/health_windows.go b/health_windows.go
+new file mode 100644
+--- /dev/null
++++ b/health_windows.go
+@@ -0,0 +1,159 @@
++//go:build windows
++
++package main
++
++import (
++	"context"
++	"crypto/subtle"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"os"
++	"strconv"
++	"sync"
++	"time"
++
++	"github.com/DaniilSokolyuk/go-pcap2socks/engine"
++	M "github.com/DaniilSokolyuk/go-pcap2socks/md"
++)
++
++// A service-owned, authenticated loopback endpoint. It is read-only and never
++// receives console payloads or changes routing. No listener without opt-in.
++func startPlatformHealth(eng *engine.Engine, iface net.Interface) (func(), error) {
++	addr, token := os.Getenv("KONSOLLINK_HEALTH_ADDR"), os.Getenv("KONSOLLINK_HEALTH_TOKEN")
++	if addr == "" && token == "" {
++		return func() {}, nil
++	}
++	host, port, err := net.SplitHostPort(addr)
++	if err != nil || host != "127.0.0.1" || len(token) != 64 {
++		return nil, fmt.Errorf("invalid service health endpoint")
++	}
++	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
++		return nil, fmt.Errorf("invalid service health port")
++	}
++	initial, err := iface.Addrs()
++	if err != nil {
++		return nil, fmt.Errorf("health interface addresses: %w", err)
++	}
++	listener, err := net.Listen("tcp4", addr)
++	if err != nil {
++		return nil, fmt.Errorf("health listen: %w", err)
++	}
++	var probe sync.Mutex
++	mux := http.NewServeMux()
++	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodGet || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) != 1 {
++			http.Error(w, "unauthorized", http.StatusUnauthorized)
++			return
++		}
++		if !probe.TryLock() {
++			http.Error(w, "probe busy", http.StatusServiceUnavailable)
++			return
++		}
++		defer probe.Unlock()
++		local, reason := true, ""
++		select {
++		case <-eng.Done():
++			local, reason = false, "capture stopped"
++		default:
++		}
++		current, err := net.InterfaceByIndex(iface.Index)
++		if err != nil || current == nil || current.Flags&net.FlagUp == 0 || current.HardwareAddr.String() != iface.HardwareAddr.String() {
++			local, reason = false, "capture interface unavailable"
++		} else {
++			addrs, err := current.Addrs()
++			if err != nil || !sameAddresses(initial, addrs) {
++				local, reason = false, "capture interface addresses changed"
++			}
++		}
++		discord, internet := false, false
++		if local {
++			discord = routedHTTPS(r.Context(), eng, "https://discord.com/api/v10/gateway")
++			internet = routedHTTPS(r.Context(), eng, "https://www.microsoft.com/")
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_ = json.NewEncoder(w).Encode(struct {
++			Schema   int    `json:"schema"`
++			PID      int    `json:"pid"`
++			Local    bool   `json:"local_ok"`
++			Discord  bool   `json:"discord_ok"`
++			Internet bool   `json:"internet_ok"`
++			Reason   string `json:"reason"`
++		}{1, os.Getpid(), local, discord, internet, reason})
++	})
++	server := &http.Server{Handler: mux, ReadHeaderTimeout: time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: time.Second, MaxHeaderBytes: 2048}
++	go func() { _ = server.Serve(listener) }()
++	return func() { _ = server.Close() }, nil
++}
++
++func sameAddresses(a, b []net.Addr) bool {
++	// IPv4 topology only: unrelated temporary IPv6 address changes must not
++	// restart this explicitly IPv4 gateway.
++	ipv4 := func(values []net.Addr) map[string]bool {
++		m := map[string]bool{}
++		for _, v := range values {
++			if ip, ok := v.(*net.IPNet); ok && ip.IP.To4() != nil {
++				m[ip.String()] = true
++			}
++		}
++		return m
++	}
++	x, y := ipv4(a), ipv4(b)
++	if len(x) != len(y) {
++		return false
++	}
++	for k := range x {
++		if !y[k] {
++			return false
++		}
++	}
++	return len(x) > 0
++}
++
++func routedHTTPS(parent context.Context, eng *engine.Engine, url string) bool {
++	ctx, cancel := context.WithTimeout(parent, 4*time.Second)
++	defer cancel()
++	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, TLSHandshakeTimeout: 2 * time.Second, ResponseHeaderTimeout: 2 * time.Second,
++		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
++			host, port, err := net.SplitHostPort(address)
++			if err != nil {
++				return nil, err
++			}
++			ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
++			if err != nil {
++				return nil, err
++			}
++			p, err := strconv.ParseUint(port, 10, 16)
++			if err != nil {
++				return nil, err
++			}
++			var last error
++			for _, ip := range ips {
++				conn, err := eng.Proxy.DialContext(ctx, &M.Metadata{Network: M.TCP, SrcIP: net.IPv4(172, 24, 2, 10), DstIP: ip, DstPort: uint16(p)})
++				if err == nil {
++					return conn, nil
++				}
++				last = err
++			}
++			if last == nil {
++				last = fmt.Errorf("no IPv4 address")
++			}
++			return nil, last
++		},
++	}
++	defer transport.CloseIdleConnections()
++	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		return false
++	}
++	response, err := client.Do(req)
++	if err != nil {
++		return false
++	}
++	defer response.Body.Close()
++	_, err = io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
++	return err == nil && response.StatusCode >= 200 && response.StatusCode < 400
++}
+diff --git a/health_other.go b/health_other.go
+new file mode 100644
+--- /dev/null
++++ b/health_other.go
+@@ -0,0 +1,10 @@
++//go:build !windows
++
++package main
++
++import (
++	"github.com/DaniilSokolyuk/go-pcap2socks/engine"
++	"net"
++)
++
++func startPlatformHealth(_ *engine.Engine, _ net.Interface) (func(), error) { return func() {}, nil }
+diff --git a/health_windows_test.go b/health_windows_test.go
+new file mode 100644
+--- /dev/null
++++ b/health_windows_test.go
+@@ -0,0 +1,122 @@
++//go:build windows
++
++package main
++
++import (
++	"encoding/json"
++	"net"
++	"net/http"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/DaniilSokolyuk/go-pcap2socks/cfg"
++	"github.com/DaniilSokolyuk/go-pcap2socks/core/device"
++	"github.com/DaniilSokolyuk/go-pcap2socks/engine"
++)
++
++func TestHealthIPv4TopologyIgnoresTemporaryIPv6(t *testing.T) {
++	addr := func(s string) net.Addr {
++		ip, n, e := net.ParseCIDR(s)
++		if e != nil {
++			t.Fatal(e)
++		}
++		n.IP = ip
++		return n
++	}
++	a := []net.Addr{addr("192.168.1.4/24"), addr("2001:db8::1/64")}
++	b := []net.Addr{addr("192.168.1.4/24"), addr("2001:db9::1/64")}
++	if !sameAddresses(a, b) {
++		t.Fatal("IPv6 change invalidated IPv4 session")
++	}
++	if sameAddresses(a, []net.Addr{addr("192.168.2.4/24")}) {
++		t.Fatal("IPv4 change was missed")
++	}
++}
++
++func TestHealthEndpointDisabledAndRejectsPublicBind(t *testing.T) {
++	t.Setenv("KONSOLLINK_HEALTH_ADDR", "")
++	t.Setenv("KONSOLLINK_HEALTH_TOKEN", "")
++	close, err := startPlatformHealth(nil, net.Interface{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	close()
++	t.Setenv("KONSOLLINK_HEALTH_ADDR", "0.0.0.0:8085")
++	t.Setenv("KONSOLLINK_HEALTH_TOKEN", strings.Repeat("a", 64))
++	if _, err = startPlatformHealth(nil, net.Interface{}); err == nil {
++		t.Fatal("public bind accepted")
++	}
++}
++
++func TestHealthEndpointAuthenticationAndStoppedCapture(t *testing.T) {
++	interfaces, err := net.Interfaces()
++	if err != nil {
++		t.Fatal(err)
++	}
++	var iface net.Interface
++	for _, i := range interfaces {
++		addrs, _ := i.Addrs()
++		if len(addrs) > 0 {
++			iface = i
++			break
++		}
++	}
++	if iface.Index == 0 {
++		t.Fatal("test requires an interface")
++	}
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	address := listener.Addr().String()
++	listener.Close()
++	t.Setenv("KONSOLLINK_HEALTH_ADDR", address)
++	t.Setenv("KONSOLLINK_HEALTH_TOKEN", strings.Repeat("a", 64))
++	_, network, _ := net.ParseCIDR("172.24.0.0/16")
++	source := device.NewMemSource(1)
++	eng, err := engine.Start(engine.Options{Config: &cfg.Config{Outbounds: []cfg.Outbound{{Direct: &cfg.OutboundDirect{}}}}, Interface: iface, Source: source, Network: &device.NetworkConfig{Network: network, LocalIP: net.IPv4(172, 24, 2, 1), LocalMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}, MTU: 1486}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer eng.Close()
++	closeHealth, err := startPlatformHealth(eng, iface)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer closeHealth()
++	client := &http.Client{Timeout: time.Second}
++	response, err := client.Get("http://" + address + "/health")
++	if err != nil {
++		t.Fatal(err)
++	}
++	response.Body.Close()
++	if response.StatusCode != http.StatusUnauthorized {
++		t.Fatal("unauthenticated request accepted")
++	}
++	source.Close()
++	select {
++	case <-eng.Done():
++	case <-time.After(time.Second):
++		t.Fatal("capture did not stop")
++	}
++	request, _ := http.NewRequest(http.MethodGet, "http://"+address+"/health", nil)
++	request.Header.Set("Authorization", "Bearer "+strings.Repeat("a", 64))
++	response, err = client.Do(request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer response.Body.Close()
++	var result struct {
++		Schema int  `json:"schema"`
++		PID    int  `json:"pid"`
++		Local  bool `json:"local_ok"`
++	}
++	if err = json.NewDecoder(response.Body).Decode(&result); err != nil {
++		t.Fatal(err)
++	}
++	if result.Schema != 1 || result.PID != os.Getpid() || result.Local {
++		t.Fatal("stopped capture reported healthy", result)
++	}
++}

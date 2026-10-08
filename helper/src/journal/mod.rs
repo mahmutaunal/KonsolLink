@@ -206,7 +206,8 @@ impl Journal {
                     && engine.step != EngineStep::Applied)
                 || (self.phase == Phase::Complete
                     && interception.step != InterceptionStep::Restored)
-                || (engine.step == EngineStep::Restored
+                || (self.phase != Phase::RollingBack
+                    && engine.step == EngineStep::Restored
                     && interception.step != InterceptionStep::Restored)
             {
                 return Err(Error::Invalid("interception ordering"));
@@ -232,12 +233,14 @@ impl Journal {
             Phase::Active => steps.iter().all(|s| *s == Step::Applied),
             Phase::Complete => steps.iter().all(|s| *s == Step::Restored),
             Phase::RollingBack => {
-                let prefix_len = steps
+                // Independent restores can finish even if an earlier restore
+                // failed. Unrestored operations retain their application order.
+                let remaining: Vec<_> = steps
                     .iter()
-                    .position(|s| *s == Step::Restored)
-                    .unwrap_or(steps.len());
-                apply_order(&steps[..prefix_len])
-                    && steps[prefix_len..].iter().all(|s| *s == Step::Restored)
+                    .copied()
+                    .filter(|step| *step != Step::Restored)
+                    .collect();
+                apply_order(&remaining)
             }
         };
         if !valid {
@@ -700,87 +703,134 @@ impl Store {
         if journal.phase == Phase::Complete {
             return Ok(());
         }
-        journal.phase = Phase::RollingBack;
-        self.save(&journal)?;
-        // Kernel settings and PF rules do not survive a reboot. Never restore
-        // an old boot's snapshot over a new boot's services.
         let same_boot = match &journal.gateway {
             Some(plan) => backend.same_boot(plan)?,
             None => true,
         };
-        if let Some(interception) = &journal.interception {
-            if same_boot
+        journal.phase = Phase::RollingBack;
+        let mut errors = Vec::new();
+        // A failed operation retains its durable step. Continue independent
+        // cleanup, then leave the journal recoverable rather than claiming OFF.
+        macro_rules! persist {
+            () => {
+                if let Err(error) = self.save(&journal) {
+                    errors.push(error);
+                }
+            };
+        }
+        persist!();
+        if let Some(record) = journal.interception.clone() {
+            let remove = if same_boot
                 && matches!(
-                    interception.step,
+                    record.step,
                     InterceptionStep::Intent | InterceptionStep::Applied
-                )
-            {
-                backend.interception(&interception.plan, false)?;
-            }
-            journal
-                .interception
-                .as_mut()
-                .expect("interception exists")
-                .step = InterceptionStep::Restored;
-            self.save(&journal)?;
-            let interception = journal.interception.as_ref().expect("interception exists");
-            if same_boot
-                && !interception.pf_was_enabled
-                && matches!(interception.pf_step, Step::Intent | Step::Applied)
-            {
-                if backend.packet_filter_enabled()? {
-                    backend.packet_filter(false)?;
+                ) {
+                backend.interception(&record.plan, false)
+            } else {
+                Ok(())
+            };
+            match remove {
+                Ok(()) => {
+                    journal.interception.as_mut().unwrap().step = InterceptionStep::Restored;
+                    persist!();
                 }
-                if backend.packet_filter_enabled()? {
-                    return Err(Error::Backend("packet filter did not stop".into()));
-                }
+                Err(error) => errors.push(error),
             }
-            if !interception.pf_was_enabled {
-                journal
-                    .interception
-                    .as_mut()
-                    .expect("interception exists")
-                    .pf_step = Step::Restored;
-                self.save(&journal)?;
+            if !record.pf_was_enabled {
+                let restore = (|| -> Result<()> {
+                    if same_boot && matches!(record.pf_step, Step::Intent | Step::Applied) {
+                        if backend.packet_filter_enabled()? {
+                            backend.packet_filter(false)?;
+                        }
+                        if backend.packet_filter_enabled()? {
+                            return Err(Error::Backend("packet filter did not stop".into()));
+                        }
+                    }
+                    Ok(())
+                })();
+                match restore {
+                    Ok(()) => {
+                        journal.interception.as_mut().unwrap().pf_step = Step::Restored;
+                        persist!();
+                    }
+                    Err(error) => errors.push(error),
+                }
             }
         }
-        if let Some(engine) = &journal.engine {
-            if same_boot && matches!(engine.step, EngineStep::Intent | EngineStep::Applied) {
-                backend.stop_engine(engine)?;
+        if let Some(record) = journal.engine.clone() {
+            let stop =
+                if same_boot && matches!(record.step, EngineStep::Intent | EngineStep::Applied) {
+                    backend.stop_engine(&record)
+                } else {
+                    Ok(())
+                };
+            match stop {
+                Ok(()) => {
+                    journal.engine.as_mut().unwrap().step = EngineStep::Restored;
+                    persist!();
+                }
+                Err(error) => errors.push(error),
             }
-            journal.engine.as_mut().expect("engine exists").step = EngineStep::Restored;
-            self.save(&journal)?;
+        }
+        // Forwarding must not be restored while an owned engine is still live.
+        // Preserve this dependency while allowing unrelated cleanup above.
+        if journal
+            .engine
+            .as_ref()
+            .is_some_and(|record| record.step != EngineStep::Restored)
+        {
+            return Err(errors.into_iter().next().unwrap_or(Error::RecoveryRequired));
         }
         for i in (0..journal.changes.len()).rev() {
             let change = &journal.changes[i];
             if change.step == Step::Restored {
                 continue;
             }
-            if same_boot && change.step != Step::Pending {
-                let current = backend.read(change.setting)?;
-                if current == change.after {
-                    backend.write(change.setting, change.before)?;
-                    if backend.read(change.setting)? != change.before {
+            let restore = (|| -> Result<()> {
+                if same_boot && change.step != Step::Pending {
+                    let current = backend.read(change.setting)?;
+                    if current == change.after {
+                        backend.write(change.setting, change.before)?;
+                        if backend.read(change.setting)? != change.before {
+                            return Err(Error::Conflict(change.setting));
+                        }
+                    } else if current != change.before {
                         return Err(Error::Conflict(change.setting));
                     }
-                } else if current != change.before {
-                    return Err(Error::Conflict(change.setting));
                 }
+                Ok(())
+            })();
+            match restore {
+                Ok(()) => {
+                    journal.changes[i].step = Step::Restored;
+                    persist!();
+                }
+                Err(error) => errors.push(error),
             }
-            journal.changes[i].step = Step::Restored;
-            self.save(&journal)?;
         }
         if let Some(plan) = &journal.gateway {
-            if same_boot
+            let remove = if same_boot
                 && matches!(
                     journal.gateway_step,
                     GatewayStep::Intent | GatewayStep::Applied
-                )
-            {
-                backend.gateway(plan, false)?;
+                ) {
+                backend.gateway(plan, false)
+            } else {
+                Ok(())
+            };
+            match remove {
+                Ok(()) => {
+                    journal.gateway_step = GatewayStep::Restored;
+                    persist!();
+                }
+                Err(error) => errors.push(error),
             }
-            journal.gateway_step = GatewayStep::Restored;
-            self.save(&journal)?;
+        }
+        if !errors.is_empty() {
+            for error in &errors {
+                eprintln!("KonsolLink recovery: {error}");
+            }
+            return Err(errors.remove(0));
         }
         journal.phase = Phase::Complete;
         self.save(&journal)

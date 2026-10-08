@@ -52,7 +52,7 @@ foreach ($name in $RuntimeFiles) {
 }
 
 $manifest = Get-Content -LiteralPath (Join-Path $PackageRoot 'runtime-manifest.json') -Raw | ConvertFrom-Json
-if ($manifest.schema -ne 1) { throw 'Unsupported runtime manifest.' }
+if ($manifest.schema -ne 1 -or $manifest.health_schema -ne 1) { throw 'Unsupported runtime manifest.' }
 $installerManifest = Get-Content -LiteralPath (Join-Path $PackageRoot 'installer-manifest.json') -Raw | ConvertFrom-Json
 if ($installerManifest.schema -ne 1 -or $installerManifest.service_sha256 -notmatch '^[0-9a-f]{64}$') {
     throw 'Unsupported installer manifest.'
@@ -96,6 +96,10 @@ try {
         $CreatedService = $true
     }
     Invoke-Sc -Arguments @('failure', $ServiceName, 'reset= 86400', 'actions= restart/3000/restart/10000//')
+    Invoke-Sc -Arguments @('failureflag', $ServiceName, '1')
+    if (-not [System.Diagnostics.EventLog]::SourceExists($ServiceName)) {
+        New-EventLog -LogName Application -Source $ServiceName
+    }
     # Authenticated desktop users may query/start/stop this one service; they cannot reconfigure it.
     Invoke-Sc -Arguments @('sdset', $ServiceName, 'D:(A;;CCLCSWRPWPDTLOCRRC;;;AU)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)')
     if ($ExistingService) {

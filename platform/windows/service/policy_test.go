@@ -21,7 +21,7 @@ func writeFixture(t *testing.T) string {
 		digest := sha256.Sum256(body)
 		files[name] = hex.EncodeToString(digest[:])
 	}
-	raw, _ := json.Marshal(manifest{Schema: 1, Files: files})
+	raw, _ := json.Marshal(manifest{Schema: 1, HealthSchema: 1, Files: files})
 	if err := os.WriteFile(filepath.Join(root, "runtime-manifest.json"), raw, 0600); err != nil {
 		t.Fatal(err)
 	}

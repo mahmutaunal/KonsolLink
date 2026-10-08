@@ -15,7 +15,8 @@ use std::{
         unix::{fs::OpenOptionsExt, process::CommandExt},
     },
     path::{Path, PathBuf},
-    process::{Child, ChildStderr, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -195,7 +196,7 @@ fn process_path(pid: u32) -> Result<Option<PathBuf>> {
 struct PendingChild {
     child: Child,
     control: Option<ChildStdin>,
-    stderr: Option<ChildStderr>,
+    diagnostics: Arc<Mutex<Vec<u8>>>,
     identity: ProcessIdentity,
     kind: EngineKind,
     policy: Option<UnixStream>,
@@ -239,12 +240,34 @@ impl PendingChild {
             .stderr
             .take()
             .ok_or_else(|| fail("missing engine diagnostic pipe"))?;
+        // Drain throughout the child's lifetime. Keep only a bounded tail;
+        // unread pipes must never backpressure the network engine.
+        let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&diagnostics);
+        thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut tail) = output.lock() {
+                            tail.extend_from_slice(&buffer[..n]);
+                            let excess = tail.len().saturating_sub(8192);
+                            tail.drain(..excess);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
         let identity = process_identity(child.id())?
             .ok_or_else(|| fail("spawned engine wrapper disappeared"))?;
         Ok(Self {
             child,
             control: Some(control),
-            stderr: Some(stderr),
+            diagnostics,
             identity,
             kind,
             policy,
@@ -267,10 +290,11 @@ impl PendingChild {
     }
 
     fn exit_detail(&mut self) -> String {
-        let mut detail = String::new();
-        if let Some(mut stderr) = self.stderr.take() {
-            let _ = stderr.read_to_string(&mut detail);
-        }
+        let detail = self
+            .diagnostics
+            .lock()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
         let detail = detail.trim();
         if detail.chars().count() > 1024 {
             format!("{}…", detail.chars().take(1024).collect::<String>())
@@ -647,6 +671,29 @@ mod tests {
         fs,
         os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     };
+
+    #[test]
+    fn diagnostics_are_drained_while_running_and_bounded() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "read token || true; dd if=/dev/zero bs=4096 count=128 >&2 2>/dev/null; printf diagnostic-tail >&2"]);
+        let mut pending = PendingChild::spawn(command, EngineKind::ZapretTpwsV72_13).unwrap();
+        pending.resume().unwrap();
+        wait_child(&mut pending.child, Duration::from_secs(10)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let bytes = pending.diagnostics.lock().unwrap();
+            assert!(bytes.len() <= 8192);
+            if bytes.ends_with(b"diagnostic-tail") {
+                break;
+            }
+            drop(bytes);
+            assert!(
+                Instant::now() < deadline,
+                "diagnostic reader failed to drain"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn artifact_hash_permissions_and_links_are_checked() {
